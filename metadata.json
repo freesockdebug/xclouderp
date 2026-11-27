@@ -1,0 +1,6 @@
+{
+  "name": "X Cloud ERP",
+  "description": "Cloudflare Pages/Workers + Supabase 多租户 Serverless 跨境电商 ERP，内置领星 MCP 亚马逊数据接入、采购进销存、FBA 货件、广告分时策略、智能利润核算、Supabase Auth/Logto 双模认证与 MCP Server 扩展。",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
