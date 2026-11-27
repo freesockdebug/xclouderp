@@ -7,6 +7,7 @@ name = "xclouderp"
 main = "worker.ts"
 compatibility_date = "2025-10-01"
 compatibility_flags = ["nodejs_compat"]
+keep_vars = true
 
 [assets]
 directory = "./dist"

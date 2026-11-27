@@ -27,3 +27,21 @@ test('05-security-ops: metadata.json and index.html are synchronized to X Cloud 
   assert.match(html, /<title>.*X Cloud ERP.*<\/title>/);
   assert.equal(fs.existsSync('.env.example'), true);
 });
+
+test('05-security-ops: GitHub Actions Cloudflare auto-deploy workflow enforces preflight gate, secrets, and keep_vars (SEC-ADV-05)', () => {
+  const wfPath = '.github/workflows/deploy-cloudflare.yml';
+  assert.equal(fs.existsSync(wfPath), true);
+  const wf = fs.readFileSync(wfPath, 'utf8');
+  assert.match(wf, /push:/);
+  assert.match(wf, /workflow_dispatch:/);
+  assert.match(wf, /contents:\s*read/);
+  assert.match(wf, /npm run check:full/);
+  assert.match(wf, /npm run build/);
+  assert.match(wf, /cloudflare\/wrangler-action@v3/);
+  assert.match(wf, /secrets\.CLOUDFLARE_API_TOKEN/);
+  assert.match(wf, /secrets\.CLOUDFLARE_ACCOUNT_ID/);
+
+  const wrangler = fs.readFileSync('wrangler.toml', 'utf8');
+  assert.match(wrangler, /keep_vars\s*=\s*true/);
+});
+

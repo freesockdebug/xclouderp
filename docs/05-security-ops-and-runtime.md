@@ -50,6 +50,9 @@ flowchart TD
    - 仅保留变量名与脱敏示例占位符，严禁写入真实 Supabase Service Role Key、Logto App Secret 或领星生产密钥。
 3. **元数据对齐契约**：
    - `metadata.json` 的 `name` 字段与 `index.html` 的 `<title>` 必须包含一致的应用品牌名 `X Cloud ERP`。
+4. **GitHub Push 自动部署 Cloudflare 契约 (`/.github/workflows/deploy-cloudflare.yml`, `/wrangler.toml`)**：
+   - 推送至 `main` / `master` 分支或手动触发 `workflow_dispatch` 时，GitHub Actions 以最小权限 (`contents: read`) 先运行 `npm run check:full` 与 `npm run build`，校验通过后通过 `cloudflare/wrangler-action@v3` 部署 `worker.ts` 与 `./dist` 静态资产至 Cloudflare Workers。
+   - `CLOUDFLARE_API_TOKEN` 与 `CLOUDFLARE_ACCOUNT_ID` 仅通过 GitHub Repository Secrets 注入，严禁硬编码进代码库；`wrangler.toml` 强制开启 `keep_vars = true`，确保每次自动部署均保留 Cloudflare Dashboard 中配置的环境变量与密钥。
 
 ---
 
@@ -72,3 +75,4 @@ flowchart TD
 | `SEC-ADV-02` | 扫描 `src/` 与 `server.ts` 严禁使用 `dangerouslySetInnerHTML` 或动态 `eval(` | 防止来自领星/亚马逊商品标题的恶意 HTML 载荷触发存储型 XSS |
 | `SEC-ADV-03` | 校验 `package.json` 必须完整声明 `check`、`check:fast`、`check:full`、`lint`、`test` 脚本 | 防止误改 `package.json` 导致工程门禁与 CI 自动化入口失效 |
 | `SEC-ADV-04` | 校验 `/AGENTS.md` 与全部 5 篇 `/docs/01-*.md` ~ `/docs/05-*.md` 均存在且包含强制规则索引章 | 落地“只增不擅删”工程宪法，防止架构文档被误删或清空 |
+| `SEC-ADV-05` | 校验 `.github/workflows/deploy-cloudflare.yml` 监听 `push` (`main`/`master`) 与 `workflow_dispatch`、声明 `contents: read`、部署前执行 `npm run check:full` 与 `npm run build`、仅引用 `secrets.CLOUDFLARE_*` 且无硬编码账户 ID/令牌，且 `wrangler.toml` 启用 `keep_vars = true` | 保障推送 GitHub 自动部署 Cloudflare Workers 时先过工程门禁、凭据零泄露，并避免自动部署覆盖 Cloudflare 控制台已配置的环境变量 |

@@ -16,6 +16,8 @@ export const securityOpsRuntimeAuditSuite: DomainAuditSuite = {
     /^scripts\//,
     /^metadata\.json$/,
     /^index\.html$/,
+    /^\.github\/workflows\//,
+    /^wrangler\.toml$/,
   ],
   unitTestFiles: ['test/05-security-ops.test.ts'],
   rules: [
@@ -144,6 +146,79 @@ export const securityOpsRuntimeAuditSuite: DomainAuditSuite = {
               remediation: `恢复并完善 ${doc}。`,
             });
           }
+        }
+        return violations;
+      },
+    },
+    {
+      id: 'SEC-ADV-05',
+      domain: DOMAIN,
+      docPath: DOC_PATH,
+      title: 'GitHub Push 自动部署 Cloudflare 流水线契约：最小权限、构建前门禁、严禁硬编码令牌且保留控制台环境变量 (keep_vars)',
+      historicalContext:
+        '缺少 CI/CD 校验或硬编码 Cloudflare Token 会引发凭据泄漏与带病上线，且 wrangler deploy 若未启用 keep_vars = true 会意外清空 Cloudflare Dashboard 中配置的明文环境变量。',
+      remediation:
+        '保持 .github/workflows/deploy-cloudflare.yml 监听 push (main/master) 与 workflow_dispatch、声明 contents: read 最小权限、部署前执行 npm run check:full 与 npm run build、仅引用 secrets.CLOUDFLARE_API_TOKEN 与 secrets.CLOUDFLARE_ACCOUNT_ID，并在 wrangler.toml 启用 keep_vars = true。',
+      check(ctx) {
+        const violations: AuditViolation[] = [];
+        const wfPath = '.github/workflows/deploy-cloudflare.yml';
+        if (!ctx.fileExists(wfPath)) {
+          return [
+            {
+              ruleId: 'SEC-ADV-05',
+              domain: DOMAIN,
+              docPath: DOC_PATH,
+              title: '缺失 GitHub Actions 自动部署流水线 .github/workflows/deploy-cloudflare.yml',
+              historicalContext: '推送 GitHub 自动部署 Cloudflare 依赖标准 workflow 定义。',
+              file: wfPath,
+              remediation: '恢复 .github/workflows/deploy-cloudflare.yml。',
+            },
+          ];
+        }
+        const wf = ctx.readFile(wfPath);
+        const wrangler = ctx.fileExists('wrangler.toml') ? ctx.readFile('wrangler.toml') : '';
+
+        if (
+          !/push:/.test(wf) ||
+          !/workflow_dispatch:/.test(wf) ||
+          !/contents:\s*read/.test(wf) ||
+          !/npm run check:full/.test(wf) ||
+          !/npm run build/.test(wf) ||
+          !/cloudflare\/wrangler-action@v3/.test(wf) ||
+          !/secrets\.CLOUDFLARE_API_TOKEN/.test(wf) ||
+          !/secrets\.CLOUDFLARE_ACCOUNT_ID/.test(wf)
+        ) {
+          violations.push({
+            ruleId: 'SEC-ADV-05',
+            domain: DOMAIN,
+            docPath: DOC_PATH,
+            title: 'deploy-cloudflare.yml 缺少触发器、最小权限、发布前门禁或标准 Secrets 引用',
+            historicalContext: 'CI 自动部署必须先过门禁再发布，且凭据仅允许来自 GitHub Secrets。',
+            file: wfPath,
+            remediation: '补齐 push/workflow_dispatch、contents: read、npm run check:full、npm run build 与 secrets.CLOUDFLARE_* 配置。',
+          });
+        }
+        if (/(?:account_id|apiToken)\s*[:=]\s*["']?[0-9a-fA-F_-]{20,}["']?/.test(wf) || /account_id\s*=\s*["'][0-9a-f]{32}["']/i.test(wrangler)) {
+          violations.push({
+            ruleId: 'SEC-ADV-05',
+            domain: DOMAIN,
+            docPath: DOC_PATH,
+            title: '检测到在工作流或 wrangler.toml 中硬编码真实 Cloudflare Account ID 或 API Token',
+            historicalContext: '账户标识与 API Token 应统一存放于 GitHub Actions Secrets，禁止硬编码进公开仓库。',
+            file: wfPath,
+            remediation: '改用 ${{ secrets.CLOUDFLARE_ACCOUNT_ID }} 与 ${{ secrets.CLOUDFLARE_API_TOKEN }} 注入。',
+          });
+        }
+        if (!/keep_vars\s*=\s*true/.test(wrangler)) {
+          violations.push({
+            ruleId: 'SEC-ADV-05',
+            domain: DOMAIN,
+            docPath: DOC_PATH,
+            title: 'wrangler.toml 未启用 keep_vars = true，CI 自动部署可能覆盖 Cloudflare 控制台环境变量',
+            historicalContext: 'Wrangler 默认会在部署时清空未写入 wrangler.toml 的控制台明文变量。',
+            file: 'wrangler.toml',
+            remediation: '在 wrangler.toml 顶层添加 keep_vars = true。',
+          });
         }
         return violations;
       },
