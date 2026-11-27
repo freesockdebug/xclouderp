@@ -73,6 +73,7 @@ import type { AuthSessionUser, AuthStatusPayload } from './services/authService'
 import {
   changeOwnPassword,
   fetchAuthStatus,
+  fetchCurrentAuthUser,
   getAuthHeaders,
   logoutAuthSession,
   registerUnauthorizedHandler,
@@ -156,8 +157,9 @@ type TenantModuleTab =
 export default function App() {
   const [darkMode, setDarkMode] = useState<boolean>(false);
 
-  // Server-Verified Authentication Session State (Bearer token held strictly in memory)
+  // Server-Verified Authentication Session State (HttpOnly signed cookie + memory Bearer token)
   const [authUser, setAuthUser] = useState<AuthSessionUser | null>(null);
+  const [authChecked, setAuthChecked] = useState<boolean>(false);
   const [authStatus, setAuthStatus] = useState<AuthStatusPayload | null>(null);
   const [authStatusError, setAuthStatusError] = useState<string>('');
   const [isChangePasswordOpen, setIsChangePasswordOpen] = useState<boolean>(false);
@@ -525,26 +527,35 @@ export default function App() {
     return () => registerUnauthorizedHandler(null);
   }, [resetWorkspaceOnSignOut, refreshAuthStatus]);
 
-  // Public bootstrap: check auth status and server DB config metadata before login
+  // Public bootstrap: restore HttpOnly cookie session + check auth status & DB metadata
   useEffect(() => {
     let active = true;
-    void Promise.all([fetchServerSupabaseConfig(), fetchAuthStatus()])
-      .then(([cfg, status]) => {
+    void Promise.all([
+      fetchServerSupabaseConfig(),
+      fetchAuthStatus(),
+      fetchCurrentAuthUser(),
+    ])
+      .then(([cfg, status, restoredUser]) => {
         if (!active) return;
         setSupabaseConfig(cfg);
         setDbConfigHydrated(true);
         setAuthStatus(status);
         setAuthStatusError('');
+        if (restoredUser) {
+          handleAuthenticated(restoredUser);
+        }
+        setAuthChecked(true);
       })
       .catch((err: unknown) => {
         if (!active) return;
         setDbConfigHydrated(true);
         setAuthStatusError(err instanceof Error ? err.message : String(err));
+        setAuthChecked(true);
       });
     return () => {
       active = false;
     };
-  }, []);
+  }, [handleAuthenticated]);
 
   // Protected ERP bootstrap: executes ONLY after authentication succeeds
   useEffect(() => {
@@ -737,6 +748,7 @@ export default function App() {
     }
     let cancelled = false;
     void fetch('/api/lingxing/scheduler/status', {
+      credentials: 'include',
       headers: { Accept: 'application/json', ...getAuthHeaders() },
     })
       .then((r) => (r.ok ? r.json() : null))
@@ -745,6 +757,7 @@ export default function App() {
         if (!st?.scheduler?.supabaseConfigured) {
           return fetch('/api/lingxing/scheduler/configure', {
             method: 'POST',
+            credentials: 'include',
             headers: { 'Content-Type': 'application/json', ...getAuthHeaders() },
             body: JSON.stringify({
               supabaseUrl: supabaseConfig.projectUrl,
@@ -1961,6 +1974,10 @@ export default function App() {
   const hasActiveImpersonation =
     portalMode === 'TENANT_WORKSPACE' &&
     isValidImpersonationSession(impersonationSession, tenants);
+
+  if (!authChecked) {
+    return <div className="min-h-screen bg-slate-50 dark:bg-slate-950" />;
+  }
 
   if (!authUser) {
     return (

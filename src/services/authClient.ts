@@ -17,10 +17,13 @@ export function clearAuthToken(): void {
 }
 
 export function getAuthHeaders(): Record<string, string> {
-  if (!memoryAuthToken) return {};
-  return {
-    Authorization: `Bearer ${memoryAuthToken}`,
+  const headers: Record<string, string> = {
+    'X-Requested-With': 'XMLHttpRequest',
   };
+  if (memoryAuthToken) {
+    headers.Authorization = `Bearer ${memoryAuthToken}`;
+  }
+  return headers;
 }
 
 export function registerUnauthorizedHandler(handler: (() => void) | null): void {
@@ -37,7 +40,8 @@ export function notifyUnauthorized(): void {
 export async function fetchAuthStatus(): Promise<AuthStatusPayload> {
   const res = await fetch('/api/auth/status', {
     method: 'GET',
-    headers: { Accept: 'application/json' },
+    credentials: 'include',
+    headers: { Accept: 'application/json', 'X-Requested-With': 'XMLHttpRequest' },
   });
   if (!res.ok) {
     throw new Error(`无法获取登录服务状态 (HTTP ${res.status})`);
@@ -66,7 +70,12 @@ export async function setupInitialAdmin(params: {
   try {
     const res = await fetch('/api/auth/setup-admin', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+      credentials: 'include',
+      headers: {
+        'Content-Type': 'application/json',
+        Accept: 'application/json',
+        'X-Requested-With': 'XMLHttpRequest',
+      },
       body: JSON.stringify(params),
     });
     const data = await res.json();
@@ -102,7 +111,12 @@ export async function loginWithPassword(params: {
   try {
     const res = await fetch('/api/auth/login', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+      credentials: 'include',
+      headers: {
+        'Content-Type': 'application/json',
+        Accept: 'application/json',
+        'X-Requested-With': 'XMLHttpRequest',
+      },
       body: JSON.stringify(params),
     });
     const data = await res.json();
@@ -127,15 +141,19 @@ export async function loginWithPassword(params: {
   }
 }
 
+/**
+ * Restores the current authenticated session from either the in-memory Bearer token
+ * or the server-managed HttpOnly session cookie (survives page refresh cleanly).
+ */
 export async function fetchCurrentAuthUser(): Promise<AuthSessionUser | null> {
-  if (!memoryAuthToken) return null;
   try {
     const res = await fetch('/api/auth/me', {
       method: 'GET',
+      credentials: 'include',
       headers: { Accept: 'application/json', ...getAuthHeaders() },
     });
     if (res.status === 401) {
-      notifyUnauthorized();
+      clearAuthToken();
       return null;
     }
     if (!res.ok) return null;
@@ -150,9 +168,13 @@ export async function logoutAuthSession(): Promise<void> {
   const headers = { Accept: 'application/json', ...getAuthHeaders() };
   clearAuthToken();
   try {
-    await fetch('/api/auth/logout', { method: 'POST', headers });
+    await fetch('/api/auth/logout', {
+      method: 'POST',
+      credentials: 'include',
+      headers,
+    });
   } catch {
-    // Stateless Bearer logout succeeds locally even if network is offline
+    // Stateless logout succeeds locally even if network is offline
   }
 }
 
@@ -163,6 +185,7 @@ export async function changeOwnPassword(params: {
   try {
     const res = await fetch('/api/auth/change-password', {
       method: 'POST',
+      credentials: 'include',
       headers: {
         'Content-Type': 'application/json',
         Accept: 'application/json',
@@ -204,6 +227,7 @@ export async function registerMemberAccount(params: {
   try {
     const res = await fetch('/api/auth/register-member', {
       method: 'POST',
+      credentials: 'include',
       headers: {
         'Content-Type': 'application/json',
         Accept: 'application/json',

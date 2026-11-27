@@ -1507,10 +1507,75 @@ test('01-core-infra: Cloudflare Workers full-stack adapter (wrangler.toml + work
     const spaRes = await handleWorkerRequest(new Request('https://xclouderp.workers.dev/amazon'), env);
     assert.equal(spaRes.status, 200);
     assert.equal(forwardedAssetPath, '/amazon');
+
+    // 6) Cloudflare Worker Lingxing scheduler starts/pauses via env DB config and reports running=true in CLOUDFLARE_CRON mode
+    const schedStartRes = await handleWorkerRequest(
+      new Request('https://xclouderp.workers.dev/api/lingxing/scheduler/configure', {
+        method: 'POST',
+        headers: authHeaders,
+        body: JSON.stringify({
+          enabled: true,
+          intervalMinutes: 30,
+          orderSyncDays: 90,
+          syncMode: 'INCREMENTAL',
+          tenantStatus: 'ACTIVE',
+        }),
+      }),
+      env
+    );
+    assert.equal(schedStartRes.status, 200);
+    const schedStartJson = (await schedStartRes.json()) as {
+      ok: boolean;
+      scheduler: {
+        enabled: boolean;
+        running: boolean;
+        runtimeMode: string;
+        cronSchedule: string | null;
+        supabaseConfigured: boolean;
+        intervalMinutes: number;
+      };
+    };
+    assert.equal(schedStartJson.ok, true);
+    assert.equal(schedStartJson.scheduler.enabled, true);
+    assert.equal(schedStartJson.scheduler.running, true);
+    assert.equal(schedStartJson.scheduler.runtimeMode, 'CLOUDFLARE_CRON');
+    assert.equal(schedStartJson.scheduler.cronSchedule, '*/15 * * * *');
+    assert.equal(schedStartJson.scheduler.supabaseConfigured, true);
+    assert.equal(schedStartJson.scheduler.intervalMinutes, 30);
+
+    // Pausing scheduler sets enabled=false & running=false
+    const schedPauseRes = await handleWorkerRequest(
+      new Request('https://xclouderp.workers.dev/api/lingxing/scheduler/configure', {
+        method: 'POST',
+        headers: authHeaders,
+        body: JSON.stringify({ enabled: false }),
+      }),
+      env
+    );
+    assert.equal(schedPauseRes.status, 200);
+    const schedPauseJson = (await schedPauseRes.json()) as {
+      ok: boolean;
+      scheduler: { enabled: boolean; running: boolean };
+    };
+    assert.equal(schedPauseJson.scheduler.enabled, false);
+    assert.equal(schedPauseJson.scheduler.running, false);
+
+    // Unconfigured env blocks enabling scheduler with HTTP 400 SUPABASE_NOT_CONFIGURED
+    const unconfiguredEnv = { AUTH_SESSION_SECRET: testSecret };
+    const noDbStartRes = await handleWorkerRequest(
+      new Request('https://xclouderp.workers.dev/api/lingxing/scheduler/configure', {
+        method: 'POST',
+        headers: authHeaders,
+        body: JSON.stringify({ enabled: true }),
+      }),
+      unconfiguredEnv
+    );
+    assert.equal(noDbStartRes.status, 400);
   } finally {
     resetWorkerRuntimeDbConfigForTest();
   }
 });
+
 
 
 

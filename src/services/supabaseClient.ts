@@ -141,6 +141,7 @@ export async function fetchServerSupabaseConfig(): Promise<SupabaseConnectionCon
   try {
     const res = await fetch('/api/platform/db-config', {
       method: 'GET',
+      credentials: 'include',
       headers: { Accept: 'application/json' },
     });
     if (!res.ok) return fallback;
@@ -190,6 +191,7 @@ export async function saveServerSupabaseConfig(
   try {
     const res = await fetch('/api/platform/db-config', {
       method: 'POST',
+      credentials: 'include',
       headers: { 'Content-Type': 'application/json', ...getAuthHeaders() },
       body: JSON.stringify({
         portalMode: 'PLATFORM_SUPER_ADMIN',

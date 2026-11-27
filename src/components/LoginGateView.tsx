@@ -339,7 +339,7 @@ export const LoginGateView: React.FC<LoginGateViewProps> = ({
 
             <div className="pt-4 border-t border-slate-200 dark:border-slate-800 text-[11px] text-slate-500 dark:text-slate-400 space-y-1">
               <div>
-                会话凭证仅保存在当前浏览器运行内存中，刷新页面或点击退出登录即自动清除。
+                会话凭证由服务端安全签名 HttpOnly Cookie 托管，刷新页面自动保持登录状态，点击退出登录即立即清除。
               </div>
               {authStatus?.envAdminConfigured && (
                 <div className="font-mono text-slate-600 dark:text-slate-300">

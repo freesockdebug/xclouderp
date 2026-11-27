@@ -107,6 +107,8 @@ interface SchedulerDomainStatView {
 interface SchedulerStatusView {
   enabled: boolean;
   running: boolean;
+  runtimeMode?: 'NODE_INTERVAL' | 'CLOUDFLARE_CRON';
+  cronSchedule?: string | null;
   isSyncingNow: boolean;
   intervalMinutes: number;
   orderSyncDays?: number;
@@ -240,6 +242,7 @@ export const LingxingMcpConnectorView: React.FC<LingxingMcpConnectorViewProps> =
   const fetchSchedulerStatus = useCallback(async () => {
     try {
       const res = await fetch('/api/lingxing/scheduler/status', {
+        credentials: 'include',
         headers: { Accept: 'application/json', ...getAuthHeaders() },
       });
       if (res.status === 401) {
@@ -280,6 +283,7 @@ export const LingxingMcpConnectorView: React.FC<LingxingMcpConnectorViewProps> =
       const targetMode = overrideSyncMode ?? syncMode;
       const res = await fetch('/api/lingxing/scheduler/configure', {
         method: 'POST',
+        credentials: 'include',
         headers: { 'Content-Type': 'application/json', ...getAuthHeaders() },
         body: JSON.stringify({
           supabaseUrl: supabaseConfig?.projectUrl,
@@ -305,9 +309,13 @@ export const LingxingMcpConnectorView: React.FC<LingxingMcpConnectorViewProps> =
         setStatusMessage(data?.message || '更新定时同步任务失败');
       } else {
         setStatusIsError(false);
+        const modeText =
+          data?.scheduler?.runtimeMode === 'CLOUDFLARE_CRON'
+            ? `Cloudflare Cron (${data.scheduler.cronSchedule || '*/15 * * * *'}) 定时同步已启动`
+            : '服务端定时同步已启动';
         setStatusMessage(
           nextEnabled
-            ? `服务端定时同步已启动（每 ${overrideInterval ?? schedulerInterval} 分钟，${
+            ? `${modeText}（每 ${overrideInterval ?? schedulerInterval} 分钟，${
                 targetMode === 'INCREMENTAL' ? '智能增量模式' : `全量回溯 ${targetDays} 天`
               }）`
             : '服务端定时同步已暂停'
@@ -328,6 +336,7 @@ export const LingxingMcpConnectorView: React.FC<LingxingMcpConnectorViewProps> =
       if (!scheduler?.supabaseConfigured && supabaseConfig?.projectUrl && supabaseConfig?.anonKey) {
         await fetch('/api/lingxing/scheduler/configure', {
           method: 'POST',
+          credentials: 'include',
           headers: { 'Content-Type': 'application/json', ...getAuthHeaders() },
           body: JSON.stringify({
             supabaseUrl: supabaseConfig.projectUrl,
@@ -343,6 +352,7 @@ export const LingxingMcpConnectorView: React.FC<LingxingMcpConnectorViewProps> =
       }
       const res = await fetch('/api/lingxing/scheduler/trigger', {
         method: 'POST',
+        credentials: 'include',
         headers: { 'Content-Type': 'application/json', ...getAuthHeaders() },
         body: JSON.stringify({
           tenantStatus: currentTenant.subscriptionStatus,
@@ -379,6 +389,7 @@ export const LingxingMcpConnectorView: React.FC<LingxingMcpConnectorViewProps> =
   }) => {
     const res = await fetch('/api/lingxing/mcp-proxy', {
       method: 'POST',
+      credentials: 'include',
       headers: { 'Content-Type': 'application/json', ...getAuthHeaders() },
       body: JSON.stringify({
         mcpEndpointUrl: mcpUrl.trim(),
@@ -1541,7 +1552,9 @@ export const LingxingMcpConnectorView: React.FC<LingxingMcpConnectorViewProps> =
                   }`}
                 >
                   {scheduler?.running
-                    ? `运行中（每 ${scheduler.intervalMinutes} 分钟）`
+                    ? scheduler.runtimeMode === 'CLOUDFLARE_CRON'
+                      ? `运行中 · Cloudflare Cron（每 ${scheduler.intervalMinutes} 分钟 · ${scheduler.cronSchedule || '*/15 * * * *'}）`
+                      : `运行中（每 ${scheduler.intervalMinutes} 分钟）`
                     : '未启动 / 已暂停'}
                 </span>
                 {scheduler && (
@@ -1556,6 +1569,9 @@ export const LingxingMcpConnectorView: React.FC<LingxingMcpConnectorViewProps> =
                   : '上次执行: 暂无'}
                 {scheduler?.nextRunAt
                   ? ` · 下次预计: ${scheduler.nextRunAt.replace('T', ' ').slice(0, 19)}`
+                  : ''}
+                {scheduler?.runtimeMode === 'CLOUDFLARE_CRON'
+                  ? ' · 状态已持久化至云端数据库'
                   : ''}
               </div>
             </div>

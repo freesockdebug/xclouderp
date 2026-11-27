@@ -1,5 +1,7 @@
 import { isTenantWritable } from '../lib/erpEngine';
 import {
+  getDynamicSupabaseClient,
+  isSupabaseConfigured,
   normalizeSupabaseProjectUrl,
   SupabaseConnectionConfig,
 } from './supabaseClient';
@@ -76,9 +78,13 @@ export interface LingxingDomainSyncStat {
   windowLabel?: string;
 }
 
+export type LingxingSchedulerRuntimeMode = 'NODE_INTERVAL' | 'CLOUDFLARE_CRON';
+
 export interface LingxingSchedulerStatus {
   enabled: boolean;
   running: boolean;
+  runtimeMode: LingxingSchedulerRuntimeMode;
+  cronSchedule: string | null;
   isSyncingNow: boolean;
   intervalMinutes: number;
   orderSyncDays: number;
@@ -96,8 +102,32 @@ export interface LingxingSchedulerStatus {
   lastDomainStats: LingxingDomainSyncStat[];
 }
 
+interface PersistedSchedulerRecord {
+  enabled: boolean;
+  intervalMinutes: number;
+  orderSyncDays: number;
+  syncMode: LingxingSyncMode;
+  orderLookbackDays: number;
+  targetTenantId: string | null;
+  lastRunAt: string | null;
+  nextRunAt: string | null;
+  lastStatus: 'IDLE' | 'RUNNING' | 'SUCCESS' | 'ERROR';
+  lastSummary: string;
+  lastError: string | null;
+  runCount: number;
+  lastCounts: LingxingSchedulerCounts | null;
+  lastDomainStats: LingxingDomainSyncStat[];
+  updatedAt: string;
+}
+
+const SCHEDULER_ENTITY_TYPE = 'schedulerState';
+const SCHEDULER_RECORD_ID = 'lingxing_auto_sync';
+const DEFAULT_CLOUDFLARE_CRON = '*/15 * * * *';
+
 interface SchedulerInternalState {
   enabled: boolean;
+  runtimeMode: LingxingSchedulerRuntimeMode;
+  cronSchedule: string | null;
   intervalMinutes: number;
   orderSyncDays: number;
   syncMode: LingxingSyncMode;
@@ -118,6 +148,8 @@ interface SchedulerInternalState {
 
 const state: SchedulerInternalState = {
   enabled: false,
+  runtimeMode: 'NODE_INTERVAL',
+  cronSchedule: null,
   intervalMinutes: 15,
   orderSyncDays: DEFAULT_ORDER_SYNC_DAYS,
   syncMode: 'INCREMENTAL',
@@ -847,6 +879,9 @@ export async function runLingxingScheduledSyncOnce(
     }
   } finally {
     state.isSyncingNow = false;
+    if (state.supabaseConfig) {
+      await persistLingxingSchedulerState(state.supabaseConfig).catch(() => undefined);
+    }
   }
 
   return getLingxingSchedulerStatus();
@@ -862,6 +897,7 @@ export function configureLingxingScheduler(opts: {
   orderLookbackDays?: number;
   enabled: boolean;
   skipIntervalTimer?: boolean;
+  cronSchedule?: string | null;
 }): LingxingSchedulerStatus {
   if (opts.supabaseUrl && opts.supabaseAnonKey) {
     const cleanUrl = normalizeSupabaseProjectUrl(opts.supabaseUrl);
@@ -894,6 +930,14 @@ export function configureLingxingScheduler(opts: {
     state.orderLookbackDays = Math.max(1, Math.min(30, Math.round(opts.orderLookbackDays)));
   }
 
+  if (opts.skipIntervalTimer) {
+    state.runtimeMode = 'CLOUDFLARE_CRON';
+    state.cronSchedule = opts.cronSchedule || DEFAULT_CLOUDFLARE_CRON;
+  } else if (opts.skipIntervalTimer === false) {
+    state.runtimeMode = 'NODE_INTERVAL';
+    state.cronSchedule = null;
+  }
+
   if (state.timer) {
     clearInterval(state.timer);
     state.timer = null;
@@ -904,15 +948,19 @@ export function configureLingxingScheduler(opts: {
   if (state.enabled) {
     const intervalMs = state.intervalMinutes * 60 * 1000;
     state.nextRunAt = new Date(Date.now() + intervalMs).toISOString();
+    const runtimeLabel =
+      state.runtimeMode === 'CLOUDFLARE_CRON'
+        ? `Cloudflare Cron (${state.cronSchedule || DEFAULT_CLOUDFLARE_CRON})`
+        : '服务端定时器';
     state.lastSummary =
       state.runCount > 0
         ? state.lastSummary
-        : `服务端定时同步已启动（每 ${state.intervalMinutes} 分钟自动同步，模式：${
+        : `${runtimeLabel}定时同步已启动（每 ${state.intervalMinutes} 分钟自动同步，模式：${
             state.syncMode === 'INCREMENTAL'
               ? `智能增量 / 订单回溯 ${state.orderLookbackDays} 天`
               : `全量回溯 ${state.orderSyncDays} 天`
           }）`;
-    if (!opts.skipIntervalTimer) {
+    if (state.runtimeMode !== 'CLOUDFLARE_CRON') {
       state.timer = setInterval(() => {
         void runLingxingScheduledSyncOnce();
       }, intervalMs);
@@ -929,6 +977,162 @@ export function configureLingxingScheduler(opts: {
   return getLingxingSchedulerStatus();
 }
 
+/**
+ * Persists scheduler configuration and run telemetry (no credentials) to Supabase erp_domain_records
+ * so stateless Cloudflare Worker isolates and Cron triggers share consistent state.
+ */
+export async function persistLingxingSchedulerState(
+  configOverride?: SupabaseConnectionConfig | null
+): Promise<boolean> {
+  const cfg = configOverride || state.supabaseConfig;
+  if (!cfg || !isSupabaseConfigured(cfg)) return false;
+  const client = getDynamicSupabaseClient(cfg);
+  if (!client) return false;
+
+  const payload: PersistedSchedulerRecord = {
+    enabled: state.enabled,
+    intervalMinutes: state.intervalMinutes,
+    orderSyncDays: state.orderSyncDays,
+    syncMode: state.syncMode,
+    orderLookbackDays: state.orderLookbackDays,
+    targetTenantId: state.targetTenantId,
+    lastRunAt: state.lastRunAt,
+    nextRunAt: state.nextRunAt,
+    lastStatus: state.lastStatus,
+    lastSummary: state.lastSummary,
+    lastError: state.lastError,
+    runCount: state.runCount,
+    lastCounts: state.lastCounts,
+    lastDomainStats: state.lastDomainStats.slice(0, 30),
+    updatedAt: new Date().toISOString(),
+  };
+
+  try {
+    const { error } = await client.from('erp_domain_records').upsert(
+      {
+        entity_type: SCHEDULER_ENTITY_TYPE,
+        record_id: SCHEDULER_RECORD_ID,
+        tenant_id: 'platform',
+        payload,
+        updated_at: payload.updatedAt,
+      },
+      { onConflict: 'entity_type,record_id' }
+    );
+    return !error;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Hydrates scheduler config and telemetry from Supabase (if previously saved) or applies defaults.
+ * Safe to invoke on every stateless Cloudflare Worker isolate before status/configure/trigger/cron.
+ */
+export async function hydrateLingxingSchedulerFromDatabase(
+  config: SupabaseConnectionConfig | null | undefined,
+  defaults?: {
+    intervalMinutes?: number;
+    orderSyncDays?: number;
+    defaultEnabled?: boolean;
+    skipIntervalTimer?: boolean;
+    cronSchedule?: string | null;
+  }
+): Promise<LingxingSchedulerStatus> {
+  const skipIntervalTimer = Boolean(defaults?.skipIntervalTimer);
+  if (skipIntervalTimer) {
+    state.runtimeMode = 'CLOUDFLARE_CRON';
+    state.cronSchedule = defaults?.cronSchedule || DEFAULT_CLOUDFLARE_CRON;
+  }
+
+  if (!config || !isSupabaseConfigured(config)) {
+    return getLingxingSchedulerStatus();
+  }
+
+  const cleanUrl = normalizeSupabaseProjectUrl(config.projectUrl);
+  if (isSafeHttpsUrl(cleanUrl)) {
+    state.supabaseConfig = {
+      projectUrl: cleanUrl,
+      anonKey: config.anonKey.trim(),
+      authMode: config.authMode || 'SUPABASE_AUTH',
+    };
+  }
+
+  const client = getDynamicSupabaseClient(state.supabaseConfig || config);
+  if (client) {
+    try {
+      const { data, error } = await client
+        .from('erp_domain_records')
+        .select('payload')
+        .eq('entity_type', SCHEDULER_ENTITY_TYPE)
+        .eq('record_id', SCHEDULER_RECORD_ID)
+        .maybeSingle();
+
+      if (!error && data?.payload && typeof data.payload === 'object') {
+        const p = data.payload as Partial<PersistedSchedulerRecord>;
+        if (typeof p.lastRunAt === 'string' || p.lastRunAt === null) state.lastRunAt = p.lastRunAt;
+        if (typeof p.nextRunAt === 'string' || p.nextRunAt === null) state.nextRunAt = p.nextRunAt;
+        if (
+          p.lastStatus === 'IDLE' ||
+          p.lastStatus === 'RUNNING' ||
+          p.lastStatus === 'SUCCESS' ||
+          p.lastStatus === 'ERROR'
+        ) {
+          state.lastStatus = state.isSyncingNow ? 'RUNNING' : p.lastStatus;
+        }
+        if (typeof p.lastSummary === 'string' && p.lastSummary) state.lastSummary = p.lastSummary;
+        if (typeof p.lastError === 'string' || p.lastError === null) state.lastError = p.lastError;
+        if (typeof p.runCount === 'number' && Number.isFinite(p.runCount)) state.runCount = p.runCount;
+        if (p.lastCounts && typeof p.lastCounts === 'object') state.lastCounts = p.lastCounts;
+        if (Array.isArray(p.lastDomainStats)) state.lastDomainStats = p.lastDomainStats;
+
+        return configureLingxingScheduler({
+          supabaseUrl: state.supabaseConfig?.projectUrl,
+          supabaseAnonKey: state.supabaseConfig?.anonKey,
+          tenantId: p.targetTenantId ?? state.targetTenantId,
+          intervalMinutes:
+            typeof p.intervalMinutes === 'number' ? p.intervalMinutes : defaults?.intervalMinutes,
+          orderSyncDays:
+            typeof p.orderSyncDays === 'number' ? p.orderSyncDays : defaults?.orderSyncDays,
+          syncMode: p.syncMode === 'FULL' || p.syncMode === 'INCREMENTAL' ? p.syncMode : 'INCREMENTAL',
+          orderLookbackDays:
+            typeof p.orderLookbackDays === 'number' ? p.orderLookbackDays : undefined,
+          enabled: typeof p.enabled === 'boolean' ? p.enabled : Boolean(defaults?.defaultEnabled),
+          skipIntervalTimer,
+          cronSchedule: defaults?.cronSchedule,
+        });
+      }
+    } catch {
+      // Fall through to env/default configuration if DB read fails transiently
+    }
+  }
+
+  return configureLingxingScheduler({
+    supabaseUrl: state.supabaseConfig?.projectUrl,
+    supabaseAnonKey: state.supabaseConfig?.anonKey,
+    intervalMinutes: defaults?.intervalMinutes ?? state.intervalMinutes,
+    orderSyncDays: defaults?.orderSyncDays ?? state.orderSyncDays,
+    syncMode: state.syncMode,
+    enabled: state.enabled || Boolean(defaults?.defaultEnabled),
+    skipIntervalTimer,
+    cronSchedule: defaults?.cronSchedule,
+  });
+}
+
+/**
+ * Checks whether a Cloudflare Cron Trigger tick should execute right now,
+ * honoring user pause state and configured intervalMinutes (e.g. 30m/60m on a 15m Cron).
+ */
+export function shouldRunCloudflareCronNow(nowMs = Date.now()): boolean {
+  if (!state.enabled || !state.supabaseConfig || state.isSyncingNow) {
+    return false;
+  }
+  if (!state.lastRunAt) return true;
+  const lastMs = Date.parse(state.lastRunAt);
+  if (!Number.isFinite(lastMs)) return true;
+  const minGapMs = Math.max(1, state.intervalMinutes - 1) * 60 * 1000;
+  return nowMs - lastMs >= minGapMs;
+}
+
 export function bootstrapLingxingSchedulerFromEnv(): void {
   const env = typeof process !== 'undefined' && process.env ? process.env : {};
   const url = env.SUPABASE_URL || env.VITE_SUPABASE_URL || '';
@@ -943,14 +1147,32 @@ export function bootstrapLingxingSchedulerFromEnv(): void {
       orderSyncDays: orderDays,
       syncMode: 'INCREMENTAL',
       enabled: true,
+      skipIntervalTimer: false,
     });
+    void hydrateLingxingSchedulerFromDatabase(
+      {
+        projectUrl: normalizeSupabaseProjectUrl(url),
+        anonKey: key.trim(),
+        authMode: 'SUPABASE_AUTH',
+      },
+      {
+        intervalMinutes: interval,
+        orderSyncDays: orderDays,
+        defaultEnabled: true,
+        skipIntervalTimer: false,
+      }
+    ).catch(() => undefined);
   }
 }
 
 export function getLingxingSchedulerStatus(): LingxingSchedulerStatus {
+  const isRunning =
+    state.enabled && (state.timer !== null || state.runtimeMode === 'CLOUDFLARE_CRON');
   return {
     enabled: state.enabled,
-    running: state.timer !== null,
+    running: isRunning,
+    runtimeMode: state.runtimeMode,
+    cronSchedule: state.cronSchedule,
     isSyncingNow: state.isSyncingNow,
     intervalMinutes: state.intervalMinutes,
     orderSyncDays: state.orderSyncDays,
@@ -967,4 +1189,29 @@ export function getLingxingSchedulerStatus(): LingxingSchedulerStatus {
     lastCounts: state.lastCounts,
     lastDomainStats: state.lastDomainStats,
   };
+}
+
+export function resetLingxingSchedulerStateForTest(): void {
+  if (state.timer) {
+    clearInterval(state.timer);
+    state.timer = null;
+  }
+  state.enabled = false;
+  state.runtimeMode = 'NODE_INTERVAL';
+  state.cronSchedule = null;
+  state.intervalMinutes = 15;
+  state.orderSyncDays = DEFAULT_ORDER_SYNC_DAYS;
+  state.syncMode = 'INCREMENTAL';
+  state.orderLookbackDays = DEFAULT_ORDER_INCREMENTAL_LOOKBACK_DAYS;
+  state.supabaseConfig = null;
+  state.targetTenantId = null;
+  state.isSyncingNow = false;
+  state.lastRunAt = null;
+  state.nextRunAt = null;
+  state.lastStatus = 'IDLE';
+  state.lastSummary = '尚未启动服务端定时同步任务';
+  state.lastError = null;
+  state.runCount = 0;
+  state.lastCounts = null;
+  state.lastDomainStats = [];
 }

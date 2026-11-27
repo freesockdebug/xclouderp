@@ -264,6 +264,67 @@ test('02-db-auth-rbac: end-to-end login authentication, PBKDF2/HMAC signing, one
     );
     assert.equal(meRes.status, 200);
 
+    // 5b. Login issues HttpOnly Secure SameSite=None Partitioned cookie; refresh restores session via Cookie alone
+    const setCookieHeader = setupRes.headers.get('set-cookie') || '';
+    assert.ok(setCookieHeader.includes('xcloud_session='));
+    assert.ok(setCookieHeader.includes('HttpOnly'));
+    assert.ok(setCookieHeader.includes('Secure'));
+    assert.ok(setCookieHeader.includes('SameSite=None'));
+    assert.ok(setCookieHeader.includes('Partitioned'));
+    const cookiePair = setCookieHeader.split(';')[0];
+
+    const meViaCookieRes = await handleWorkerRequest(
+      new Request('https://xclouderp.workers.dev/api/auth/me', {
+        headers: { Cookie: cookiePair },
+      }),
+      env
+    );
+    assert.equal(meViaCookieRes.status, 200);
+
+    // Cookie-authenticated POST without X-Requested-With or same-origin Origin is blocked (CSRF guard)
+    const csrfBlockedRes = await handleWorkerRequest(
+      new Request('https://xclouderp.workers.dev/api/erp/cache/invalidate', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Cookie: cookiePair,
+          Origin: 'https://evil-attacker.example.com',
+          Host: 'xclouderp.workers.dev',
+        },
+        body: JSON.stringify({}),
+      }),
+      env
+    );
+    assert.equal(csrfBlockedRes.status, 401);
+
+    // Cookie-authenticated POST with X-Requested-With: XMLHttpRequest succeeds seamlessly after refresh
+    const cookiePostOkRes = await handleWorkerRequest(
+      new Request('https://xclouderp.workers.dev/api/erp/cache/invalidate', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Cookie: cookiePair,
+          'X-Requested-With': 'XMLHttpRequest',
+        },
+        body: JSON.stringify({}),
+      }),
+      env
+    );
+    assert.equal(cookiePostOkRes.status, 200);
+
+    // Logout clears the HttpOnly cookie with Max-Age=0
+    const logoutRes = await handleWorkerRequest(
+      new Request('https://xclouderp.workers.dev/api/auth/logout', {
+        method: 'POST',
+        headers: { Cookie: cookiePair, 'X-Requested-With': 'XMLHttpRequest' },
+      }),
+      env
+    );
+    assert.equal(logoutRes.status, 200);
+    const clearedCookie = logoutRes.headers.get('set-cookie') || '';
+    assert.ok(clearedCookie.includes('xcloud_session='));
+    assert.ok(clearedCookie.includes('Max-Age=0'));
+
     // 6. Password change invalidates old password and enables new password
     const pwdChange = await changeAccountPassword(env, undefined, {
       id: 'usr-owner',

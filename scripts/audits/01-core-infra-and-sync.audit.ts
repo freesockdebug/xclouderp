@@ -38,6 +38,10 @@ import {
   resetWorkerRuntimeDbConfigForTest,
 } from '../../worker';
 import { createSignedSessionToken } from '../../src/services/authService';
+import {
+  resetLingxingSchedulerStateForTest,
+  shouldRunCloudflareCronNow,
+} from '../../src/services/lingxingAutoSyncRunner';
 
 const DOMAIN = '01-core-infra-and-sync';
 const DOC_PATH = 'docs/01-core-infra-and-sync.md';
@@ -1720,6 +1724,35 @@ export const coreInfraAuditSuite: DomainAuditSuite = {
         mockEnv
       );
 
+      // Verify Cloudflare Worker scheduler configure uses env DB config and reports running=true in CLOUDFLARE_CRON mode
+      resetLingxingSchedulerStateForTest();
+      const schedStartRes = await handleWorkerRequest(
+        new Request('https://xclouderp.example.workers.dev/api/lingxing/scheduler/configure', {
+          method: 'POST',
+          headers: authHeaders,
+          body: JSON.stringify({ enabled: true, intervalMinutes: 15, syncMode: 'INCREMENTAL' }),
+        }),
+        mockEnv
+      );
+      const schedStartJson = (await schedStartRes.json()) as {
+        ok?: boolean;
+        scheduler?: { enabled?: boolean; running?: boolean; runtimeMode?: string; supabaseConfigured?: boolean };
+      };
+      const cronAllowedWhenEnabled = shouldRunCloudflareCronNow();
+      const schedPauseRes = await handleWorkerRequest(
+        new Request('https://xclouderp.example.workers.dev/api/lingxing/scheduler/configure', {
+          method: 'POST',
+          headers: authHeaders,
+          body: JSON.stringify({ enabled: false }),
+        }),
+        mockEnv
+      );
+      const schedPauseJson = (await schedPauseRes.json()) as {
+        ok?: boolean;
+        scheduler?: { enabled?: boolean; running?: boolean };
+      };
+      const cronBlockedWhenPaused = !shouldRunCloudflareCronNow();
+
       if (
         cfgRes.status !== 200 ||
         cfgJson.configSource !== 'ENV' ||
@@ -1730,20 +1763,31 @@ export const coreInfraAuditSuite: DomainAuditSuite = {
         expiredProxyRes.status !== 402 ||
         invalidPageRes.status !== 400 ||
         spaRes.status !== 200 ||
-        assetFetchedPath !== '/overview'
+        assetFetchedPath !== '/overview' ||
+        schedStartRes.status !== 200 ||
+        schedStartJson.scheduler?.enabled !== true ||
+        schedStartJson.scheduler?.running !== true ||
+        schedStartJson.scheduler?.runtimeMode !== 'CLOUDFLARE_CRON' ||
+        schedStartJson.scheduler?.supabaseConfigured !== true ||
+        !cronAllowedWhenEnabled ||
+        schedPauseRes.status !== 200 ||
+        schedPauseJson.scheduler?.enabled !== false ||
+        schedPauseJson.scheduler?.running !== false ||
+        !cronBlockedWhenPaused
       ) {
         violations.push({
           ruleId: 'INFRA-ADV-15',
           domain: DOMAIN,
           docPath: DOC_PATH,
-          title: '内存故障注入失败: Cloudflare Worker 环境变量读取、安全隔离拦截或静态资源回落异常',
-          historicalContext: 'worker.ts 必须从 Cloudflare env 读取公开连接配置且绝不泄漏高危密钥，正确执行 401/403/402/400 防线并将前端路由委派至 env.ASSETS.fetch。',
+          title: '内存故障注入失败: Cloudflare Worker 环境变量读取、安全隔离拦截、Cron 定时任务启停或静态资源回落异常',
+          historicalContext: 'worker.ts 必须从 Cloudflare env 读取公开连接配置且绝不泄漏高危密钥，正确执行 401/403/402/400 防线、CLOUDFLARE_CRON 定时同步状态机并将前端路由委派至 env.ASSETS.fetch。',
           file: 'worker.ts',
-          remediation: '检查 worker.ts 中的 handleWorkerRequest 实现。',
+          remediation: '检查 worker.ts 中的 handleWorkerRequest 与 lingxingAutoSyncRunner.ts 实现。',
         });
       }
     } finally {
       resetWorkerRuntimeDbConfigForTest();
+      resetLingxingSchedulerStateForTest();
     }
     return violations;
   },

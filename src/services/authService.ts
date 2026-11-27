@@ -300,10 +300,71 @@ export async function verifySignedSessionToken(
   }
 }
 
+export const SESSION_COOKIE_NAME = 'xcloud_session';
+
 export function extractBearerToken(authHeader?: string | null): string {
   if (!authHeader || typeof authHeader !== 'string') return '';
   const match = /^Bearer\s+(.+)$/i.exec(authHeader.trim());
   return match ? match[1].trim() : '';
+}
+
+export function extractSessionTokenFromCookie(cookieHeader?: string | null): string {
+  if (!cookieHeader || typeof cookieHeader !== 'string') return '';
+  const pairs = cookieHeader.split(';');
+  for (const pair of pairs) {
+    const eqIdx = pair.indexOf('=');
+    if (eqIdx <= 0) continue;
+    const name = pair.slice(0, eqIdx).trim();
+    if (name !== SESSION_COOKIE_NAME) continue;
+    const rawVal = pair.slice(eqIdx + 1).trim();
+    if (!rawVal) return '';
+    try {
+      return decodeURIComponent(rawVal);
+    } catch {
+      return rawVal;
+    }
+  }
+  return '';
+}
+
+/**
+ * Builds a Set-Cookie header for the signed HttpOnly session cookie.
+ * Uses HttpOnly; Secure; SameSite=None; Partitioned over HTTPS (supports both
+ * top-level Cloudflare domains and embedded HTTPS previews), and HttpOnly on plain HTTP loopback.
+ */
+export function buildSessionCookieHeader(
+  token: string,
+  options: { isHttps: boolean; clear?: boolean; maxAgeSeconds?: number }
+): string {
+  const maxAge = options.clear
+    ? 0
+    : Math.max(60, Math.floor(options.maxAgeSeconds ?? SESSION_TTL_SECONDS));
+  const value = options.clear ? '' : encodeURIComponent(token);
+  const parts = [`${SESSION_COOKIE_NAME}=${value}`, 'Path=/', 'HttpOnly', `Max-Age=${maxAge}`];
+  if (options.isHttps) {
+    parts.push('SameSite=None', 'Secure', 'Partitioned');
+  }
+  return parts.join('; ');
+}
+
+export function isSameOriginHeader(
+  originHeader?: string | null,
+  hostHeader?: string | null,
+  forwardedHostHeader?: string | null
+): boolean {
+  if (!originHeader || typeof originHeader !== 'string') return false;
+  const expectedHost = (
+    (typeof forwardedHostHeader === 'string' && forwardedHostHeader.split(',')[0]?.trim()) ||
+    (typeof hostHeader === 'string' && hostHeader.trim()) ||
+    ''
+  ).toLowerCase();
+  if (!expectedHost) return false;
+  try {
+    const parsed = new URL(originHeader.trim());
+    return parsed.host.toLowerCase() === expectedHost;
+  } catch {
+    return false;
+  }
 }
 
 function isNonPlaceholderSecret(val?: string): boolean {
@@ -762,6 +823,53 @@ export async function verifyRequestBearerAuth(
   if (!token) return null;
   const signingSecret = await resolveSessionSigningSecret(env, dbConfig);
   return verifySignedSessionToken(token, signingSecret);
+}
+
+/**
+ * Verifies authentication via either Authorization: Bearer <token> OR the signed HttpOnly cookie.
+ * When authenticating a mutating request (POST/PUT/PATCH/DELETE) via cookie alone, enforces
+ * CSRF verification via X-Requested-With header or matching Origin vs Host/X-Forwarded-Host.
+ */
+export async function verifyRequestAuth(
+  params: {
+    authHeader?: string | null;
+    cookieHeader?: string | null;
+    method?: string;
+    requestedWithHeader?: string | null;
+    originHeader?: string | null;
+    hostHeader?: string | null;
+    forwardedHostHeader?: string | null;
+  },
+  env: AuthEnvVars,
+  dbConfig?: SupabaseConnectionConfig
+): Promise<AuthSessionUser | null> {
+  const bearerToken = extractBearerToken(params.authHeader);
+  const signingSecret = await resolveSessionSigningSecret(env, dbConfig);
+  if (bearerToken) {
+    const bearerUser = await verifySignedSessionToken(bearerToken, signingSecret);
+    if (bearerUser) return bearerUser;
+  }
+
+  const cookieToken = extractSessionTokenFromCookie(params.cookieHeader);
+  if (!cookieToken) return null;
+
+  const upperMethod = (params.method || 'GET').toUpperCase();
+  const isMutating = upperMethod !== 'GET' && upperMethod !== 'HEAD' && upperMethod !== 'OPTIONS';
+  if (isMutating) {
+    const hasCustomHeader =
+      typeof params.requestedWithHeader === 'string' &&
+      params.requestedWithHeader.trim().toLowerCase() === 'xmlhttprequest';
+    const hasMatchingOrigin = isSameOriginHeader(
+      params.originHeader,
+      params.hostHeader,
+      params.forwardedHostHeader
+    );
+    if (!hasCustomHeader && !hasMatchingOrigin) {
+      return null;
+    }
+  }
+
+  return verifySignedSessionToken(cookieToken, signingSecret);
 }
 
 /**

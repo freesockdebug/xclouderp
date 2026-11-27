@@ -7,6 +7,8 @@ import {
   bootstrapLingxingSchedulerFromEnv,
   configureLingxingScheduler,
   getLingxingSchedulerStatus,
+  hydrateLingxingSchedulerFromDatabase,
+  persistLingxingSchedulerState,
   runLingxingScheduledSyncOnce,
 } from './src/services/lingxingAutoSyncRunner';
 import { normalizeSupabaseProjectUrl } from './src/services/supabaseClient';
@@ -21,11 +23,12 @@ import {
 } from './src/services/backendDataEngine';
 import {
   authenticateCredentials,
+  buildSessionCookieHeader,
   changeAccountPassword,
   getAuthStatus,
   setupInitialAdminAccount,
   upsertMemberLoginAccount,
-  verifyRequestBearerAuth,
+  verifyRequestAuth,
   type AuthEnvVars,
   type AuthSessionUser,
 } from './src/services/authService';
@@ -123,13 +126,38 @@ async function startServer() {
     AUTH_MODE: process.env.AUTH_MODE,
   });
 
+  const isSecureExpressRequest = (req: express.Request): boolean =>
+    Boolean(
+      req.secure ||
+        String(req.headers['x-forwarded-proto'] || '')
+          .split(',')[0]
+          ?.trim()
+          .toLowerCase() === 'https' ||
+        String(req.headers.origin || '').startsWith('https://')
+    );
+
   const requireAuthenticatedSession = async (
     req: express.Request,
     res: express.Response
   ): Promise<AuthSessionUser | null> => {
     const { config } = getEffectiveServerDbConfig();
-    const session = await verifyRequestBearerAuth(
-      req.headers.authorization,
+    const session = await verifyRequestAuth(
+      {
+        authHeader: req.headers.authorization,
+        cookieHeader: req.headers.cookie,
+        method: req.method,
+        requestedWithHeader:
+          typeof req.headers['x-requested-with'] === 'string'
+            ? req.headers['x-requested-with']
+            : undefined,
+        originHeader:
+          typeof req.headers.origin === 'string' ? req.headers.origin : undefined,
+        hostHeader: typeof req.headers.host === 'string' ? req.headers.host : undefined,
+        forwardedHostHeader:
+          typeof req.headers['x-forwarded-host'] === 'string'
+            ? req.headers['x-forwarded-host']
+            : undefined,
+      },
       getAuthEnv(),
       config
     );
@@ -177,6 +205,10 @@ async function startServer() {
         message: result.message,
       });
     }
+    res.setHeader(
+      'Set-Cookie',
+      buildSessionCookieHeader(result.token, { isHttps: isSecureExpressRequest(req) })
+    );
     return res.status(200).json({
       ok: true,
       token: result.token,
@@ -200,6 +232,10 @@ async function startServer() {
         message: result.message,
       });
     }
+    res.setHeader(
+      'Set-Cookie',
+      buildSessionCookieHeader(result.token, { isHttps: isSecureExpressRequest(req) })
+    );
     return res.status(200).json({
       ok: true,
       token: result.token,
@@ -208,7 +244,11 @@ async function startServer() {
     });
   });
 
-  app.post('/api/auth/logout', (_req, res) => {
+  app.post('/api/auth/logout', (req, res) => {
+    res.setHeader(
+      'Set-Cookie',
+      buildSessionCookieHeader('', { isHttps: isSecureExpressRequest(req), clear: true })
+    );
     return res.status(200).json({ ok: true });
   });
 
@@ -234,6 +274,10 @@ async function startServer() {
         message: result.message,
       });
     }
+    res.setHeader(
+      'Set-Cookie',
+      buildSessionCookieHeader(result.token, { isHttps: isSecureExpressRequest(req) })
+    );
     return res.status(200).json({
       ok: true,
       token: result.token,
@@ -712,9 +756,18 @@ async function startServer() {
   app.get('/api/lingxing/scheduler/status', async (req, res) => {
     const session = await requireAuthenticatedSession(req, res);
     if (!session) return;
+    const { config } = getEffectiveServerDbConfig();
+    const scheduler = isValidConfiguredPair(config.projectUrl, config.anonKey)
+      ? await hydrateLingxingSchedulerFromDatabase(config, {
+          intervalMinutes: Number(process.env.LINGXING_SYNC_INTERVAL_MINUTES) || 15,
+          orderSyncDays: Number(process.env.LINGXING_ORDER_SYNC_DAYS) || 90,
+          defaultEnabled: true,
+          skipIntervalTimer: false,
+        })
+      : getLingxingSchedulerStatus();
     return res.status(200).json({
       ok: true,
-      scheduler: getLingxingSchedulerStatus(),
+      scheduler,
     });
   });
 
@@ -739,8 +792,18 @@ async function startServer() {
       });
     }
 
-    if (typeof supabaseUrl === 'string' && supabaseUrl.trim()) {
-      const check = validateSafeExternalMcpUrl(supabaseUrl.trim());
+    const { config: serverDbConfig } = getEffectiveServerDbConfig();
+    const effectiveSupabaseUrl =
+      typeof supabaseUrl === 'string' && supabaseUrl.trim()
+        ? normalizeSupabaseProjectUrl(supabaseUrl.trim())
+        : serverDbConfig.projectUrl;
+    const effectiveSupabaseAnonKey =
+      typeof supabaseAnonKey === 'string' && supabaseAnonKey.trim()
+        ? supabaseAnonKey.trim()
+        : serverDbConfig.anonKey;
+
+    if (effectiveSupabaseUrl) {
+      const check = validateSafeExternalMcpUrl(effectiveSupabaseUrl);
       if (!check.valid) {
         return res.status(400).json({
           ok: false,
@@ -750,9 +813,18 @@ async function startServer() {
       }
     }
 
+    if (enabled && !isValidConfiguredPair(effectiveSupabaseUrl, effectiveSupabaseAnonKey)) {
+      return res.status(400).json({
+        ok: false,
+        errorCode: 'SUPABASE_NOT_CONFIGURED',
+        message: '尚未配置有效的 Supabase 数据库连接（SUPABASE_URL / SUPABASE_ANON_KEY），无法启动定时同步任务。',
+        scheduler: getLingxingSchedulerStatus(),
+      });
+    }
+
     const scheduler = configureLingxingScheduler({
-      supabaseUrl: typeof supabaseUrl === 'string' ? supabaseUrl : undefined,
-      supabaseAnonKey: typeof supabaseAnonKey === 'string' ? supabaseAnonKey : undefined,
+      supabaseUrl: effectiveSupabaseUrl || undefined,
+      supabaseAnonKey: effectiveSupabaseAnonKey || undefined,
       tenantId: typeof tenantId === 'string' ? tenantId : undefined,
       intervalMinutes: typeof intervalMinutes === 'number' ? intervalMinutes : undefined,
       orderSyncDays:
@@ -764,7 +836,16 @@ async function startServer() {
       orderLookbackDays:
         typeof req.body?.orderLookbackDays === 'number' ? req.body.orderLookbackDays : undefined,
       enabled: Boolean(enabled),
+      skipIntervalTimer: false,
     });
+
+    if (isValidConfiguredPair(effectiveSupabaseUrl, effectiveSupabaseAnonKey)) {
+      await persistLingxingSchedulerState({
+        projectUrl: effectiveSupabaseUrl,
+        anonKey: effectiveSupabaseAnonKey,
+        authMode: serverDbConfig.authMode,
+      });
+    }
 
     return res.status(200).json({
       ok: true,
@@ -781,6 +862,15 @@ async function startServer() {
         ok: false,
         errorCode: 'TENANT_SUBSCRIPTION_EXPIRED',
         message: `租户处于 [${tenantStatus}] 状态，已阻断定时同步立即触发。`,
+      });
+    }
+    const { config } = getEffectiveServerDbConfig();
+    if (isValidConfiguredPair(config.projectUrl, config.anonKey)) {
+      await hydrateLingxingSchedulerFromDatabase(config, {
+        intervalMinutes: Number(process.env.LINGXING_SYNC_INTERVAL_MINUTES) || 15,
+        orderSyncDays: Number(process.env.LINGXING_ORDER_SYNC_DAYS) || 90,
+        defaultEnabled: true,
+        skipIntervalTimer: false,
       });
     }
     const scheduler = await runLingxingScheduledSyncOnce(

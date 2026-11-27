@@ -1,7 +1,10 @@
 import {
   configureLingxingScheduler,
   getLingxingSchedulerStatus,
+  hydrateLingxingSchedulerFromDatabase,
+  persistLingxingSchedulerState,
   runLingxingScheduledSyncOnce,
+  shouldRunCloudflareCronNow,
 } from './src/services/lingxingAutoSyncRunner';
 import { normalizeSupabaseProjectUrl } from './src/services/supabaseClient';
 import {
@@ -15,11 +18,12 @@ import {
 } from './src/services/backendDataEngine';
 import {
   authenticateCredentials,
+  buildSessionCookieHeader,
   changeAccountPassword,
   getAuthStatus,
   setupInitialAdminAccount,
   upsertMemberLoginAccount,
-  verifyRequestBearerAuth,
+  verifyRequestAuth,
   type AuthEnvVars,
   type AuthSessionUser,
 } from './src/services/authService';
@@ -70,12 +74,17 @@ interface WorkerPlatformDbConfig {
 
 let runtimeWorkerDbConfig: WorkerPlatformDbConfig | null = null;
 
-function jsonResponse(payload: unknown, status = 200): Response {
+function jsonResponse(
+  payload: unknown,
+  status = 200,
+  extraHeaders?: Record<string, string>
+): Response {
   return new Response(JSON.stringify(payload), {
     status,
     headers: {
       'Content-Type': 'application/json; charset=utf-8',
       'Cache-Control': 'no-store',
+      ...(extraHeaders || {}),
     },
   });
 }
@@ -245,22 +254,20 @@ export function parseMcpResponseBody(rawText: string, contentType: string): unkn
   }
 }
 
-function hydrateSchedulerConfigFromWorkerEnv(env: CloudflareWorkerEnv): void {
+async function hydrateSchedulerStateFromWorkerEnv(env: CloudflareWorkerEnv) {
   const { config } = getEffectiveWorkerDbConfig(env);
-  if (!isValidConfiguredPair(config.projectUrl, config.anonKey)) return;
-  const current = getLingxingSchedulerStatus();
-  if (current.supabaseConfigured) return;
   const interval = Number(env.LINGXING_SYNC_INTERVAL_MINUTES) || 15;
   const orderDays = Number(env.LINGXING_ORDER_SYNC_DAYS) || 90;
-  configureLingxingScheduler({
-    supabaseUrl: config.projectUrl,
-    supabaseAnonKey: config.anonKey,
-    intervalMinutes: interval,
-    orderSyncDays: orderDays,
-    syncMode: 'INCREMENTAL',
-    enabled: true,
-    skipIntervalTimer: true,
-  });
+  return hydrateLingxingSchedulerFromDatabase(
+    isValidConfiguredPair(config.projectUrl, config.anonKey) ? config : null,
+    {
+      intervalMinutes: interval,
+      orderSyncDays: orderDays,
+      defaultEnabled: true,
+      skipIntervalTimer: true,
+      cronSchedule: '*/15 * * * *',
+    }
+  );
 }
 
 function getWorkerAuthEnv(env: CloudflareWorkerEnv): AuthEnvVars {
@@ -272,13 +279,32 @@ function getWorkerAuthEnv(env: CloudflareWorkerEnv): AuthEnvVars {
   };
 }
 
+function isSecureWorkerRequest(request: Request, url: URL): boolean {
+  return (
+    url.protocol === 'https:' ||
+    String(request.headers.get('x-forwarded-proto') || '')
+      .split(',')[0]
+      ?.trim()
+      .toLowerCase() === 'https' ||
+    String(request.headers.get('origin') || '').startsWith('https://')
+  );
+}
+
 async function requireAuthenticatedSession(
   request: Request,
   env: CloudflareWorkerEnv
 ): Promise<{ ok: true; session: AuthSessionUser } | { ok: false; response: Response }> {
   const { config } = getEffectiveWorkerDbConfig(env);
-  const session = await verifyRequestBearerAuth(
-    request.headers.get('authorization'),
+  const session = await verifyRequestAuth(
+    {
+      authHeader: request.headers.get('authorization'),
+      cookieHeader: request.headers.get('cookie'),
+      method: request.method,
+      requestedWithHeader: request.headers.get('x-requested-with'),
+      originHeader: request.headers.get('origin'),
+      hostHeader: request.headers.get('host'),
+      forwardedHostHeader: request.headers.get('x-forwarded-host'),
+    },
     getWorkerAuthEnv(env),
     config
   );
@@ -305,6 +331,7 @@ export async function handleWorkerRequest(
   const url = new URL(request.url);
   const pathname = url.pathname;
   const method = request.method.toUpperCase();
+  const isHttps = isSecureWorkerRequest(request, url);
 
   if (pathname === '/api/health' && method === 'GET') {
     const { configSource } = getEffectiveWorkerDbConfig(env);
@@ -339,13 +366,17 @@ export async function handleWorkerRequest(
         result.status
       );
     }
-    return jsonResponse({
-      ok: true,
-      token: result.token,
-      expiresAt: result.expiresAt,
-      user: result.user,
-      persistedToDb: result.persistedToDb,
-    });
+    return jsonResponse(
+      {
+        ok: true,
+        token: result.token,
+        expiresAt: result.expiresAt,
+        user: result.user,
+        persistedToDb: result.persistedToDb,
+      },
+      200,
+      { 'Set-Cookie': buildSessionCookieHeader(result.token, { isHttps }) }
+    );
   }
 
   if (pathname === '/api/auth/login' && method === 'POST') {
@@ -364,16 +395,22 @@ export async function handleWorkerRequest(
         result.status
       );
     }
-    return jsonResponse({
-      ok: true,
-      token: result.token,
-      expiresAt: result.expiresAt,
-      user: result.user,
-    });
+    return jsonResponse(
+      {
+        ok: true,
+        token: result.token,
+        expiresAt: result.expiresAt,
+        user: result.user,
+      },
+      200,
+      { 'Set-Cookie': buildSessionCookieHeader(result.token, { isHttps }) }
+    );
   }
 
   if (pathname === '/api/auth/logout' && method === 'POST') {
-    return jsonResponse({ ok: true });
+    return jsonResponse({ ok: true }, 200, {
+      'Set-Cookie': buildSessionCookieHeader('', { isHttps, clear: true }),
+    });
   }
 
   if (pathname === '/api/auth/me' && method === 'GET') {
@@ -401,12 +438,16 @@ export async function handleWorkerRequest(
         result.status
       );
     }
-    return jsonResponse({
-      ok: true,
-      token: result.token,
-      expiresAt: result.expiresAt,
-      message: result.message,
-    });
+    return jsonResponse(
+      {
+        ok: true,
+        token: result.token,
+        expiresAt: result.expiresAt,
+        message: result.message,
+      },
+      200,
+      { 'Set-Cookie': buildSessionCookieHeader(result.token, { isHttps }) }
+    );
   }
 
   if (pathname === '/api/auth/register-member' && method === 'POST') {
@@ -912,10 +953,10 @@ export async function handleWorkerRequest(
   if (pathname === '/api/lingxing/scheduler/status' && method === 'GET') {
     const auth = await requireAuthenticatedSession(request, env);
     if (!auth.ok) return auth.response;
-    hydrateSchedulerConfigFromWorkerEnv(env);
+    const scheduler = await hydrateSchedulerStateFromWorkerEnv(env);
     return jsonResponse({
       ok: true,
-      scheduler: getLingxingSchedulerStatus(),
+      scheduler,
     });
   }
 
@@ -950,8 +991,18 @@ export async function handleWorkerRequest(
       );
     }
 
-    if (typeof supabaseUrl === 'string' && supabaseUrl.trim()) {
-      const check = validateSafeExternalMcpUrl(supabaseUrl.trim());
+    const { config: workerDbConfig } = getEffectiveWorkerDbConfig(env);
+    const effectiveSupabaseUrl =
+      typeof supabaseUrl === 'string' && supabaseUrl.trim()
+        ? normalizeSupabaseProjectUrl(supabaseUrl.trim())
+        : workerDbConfig.projectUrl;
+    const effectiveSupabaseAnonKey =
+      typeof supabaseAnonKey === 'string' && supabaseAnonKey.trim()
+        ? supabaseAnonKey.trim()
+        : workerDbConfig.anonKey;
+
+    if (effectiveSupabaseUrl) {
+      const check = validateSafeExternalMcpUrl(effectiveSupabaseUrl);
       if (!check.valid) {
         return jsonResponse(
           {
@@ -964,9 +1015,22 @@ export async function handleWorkerRequest(
       }
     }
 
+    if (enabled && !isValidConfiguredPair(effectiveSupabaseUrl, effectiveSupabaseAnonKey)) {
+      return jsonResponse(
+        {
+          ok: false,
+          errorCode: 'SUPABASE_NOT_CONFIGURED',
+          message:
+            'Cloudflare Worker 尚未配置有效的 SUPABASE_URL / SUPABASE_ANON_KEY，无法启动定时同步任务。请在 Cloudflare Settings -> Variables and Secrets 中配置后重试。',
+          scheduler: getLingxingSchedulerStatus(),
+        },
+        400
+      );
+    }
+
     const scheduler = configureLingxingScheduler({
-      supabaseUrl: typeof supabaseUrl === 'string' ? supabaseUrl : undefined,
-      supabaseAnonKey: typeof supabaseAnonKey === 'string' ? supabaseAnonKey : undefined,
+      supabaseUrl: effectiveSupabaseUrl || undefined,
+      supabaseAnonKey: effectiveSupabaseAnonKey || undefined,
       tenantId: typeof tenantId === 'string' ? tenantId : undefined,
       intervalMinutes: typeof intervalMinutes === 'number' ? intervalMinutes : undefined,
       orderSyncDays: typeof orderSyncDays === 'number' ? orderSyncDays : undefined,
@@ -974,7 +1038,16 @@ export async function handleWorkerRequest(
       orderLookbackDays: typeof orderLookbackDays === 'number' ? orderLookbackDays : undefined,
       enabled: Boolean(enabled),
       skipIntervalTimer: true,
+      cronSchedule: '*/15 * * * *',
     });
+
+    if (isValidConfiguredPair(effectiveSupabaseUrl, effectiveSupabaseAnonKey)) {
+      await persistLingxingSchedulerState({
+        projectUrl: effectiveSupabaseUrl,
+        anonKey: effectiveSupabaseAnonKey,
+        authMode: workerDbConfig.authMode,
+      });
+    }
 
     return jsonResponse({ ok: true, scheduler });
   }
@@ -997,7 +1070,7 @@ export async function handleWorkerRequest(
         402
       );
     }
-    hydrateSchedulerConfigFromWorkerEnv(env);
+    await hydrateSchedulerStateFromWorkerEnv(env);
     const scheduler = await runLingxingScheduledSyncOnce(
       typeof orderSyncDays === 'number' ? orderSyncDays : undefined,
       syncMode === 'FULL' || syncMode === 'INCREMENTAL' ? syncMode : undefined
@@ -1329,11 +1402,15 @@ export default {
     env: CloudflareWorkerEnv,
     ctx: CloudflareExecutionContext
   ): Promise<void> {
-    hydrateSchedulerConfigFromWorkerEnv(env);
     ctx.waitUntil(
-      runLingxingScheduledSyncOnce(undefined, 'INCREMENTAL').finally(() => {
+      (async () => {
+        const status = await hydrateSchedulerStateFromWorkerEnv(env);
+        if (!shouldRunCloudflareCronNow()) {
+          return;
+        }
+        await runLingxingScheduledSyncOnce(undefined, status.syncMode);
         invalidateBackendEntityCache();
-      })
+      })()
     );
   },
 };

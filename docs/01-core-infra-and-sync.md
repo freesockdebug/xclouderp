@@ -83,6 +83,7 @@ sequenceDiagram
 8. **Cloudflare Workers 全栈资产部署契约 (`wrangler.toml`, `worker.ts`)**：
    - 根目录 `wrangler.toml` 声明 `name = "xclouderp"`、`main = "worker.ts"`、`compatibility_flags = ["nodejs_compat"]`，以及 `[assets]`（`directory = "./dist"`、`binding = "ASSETS"`、`not_found_handling = "single-page-application"`、`run_worker_first = ["/api/*"]`）与 `[triggers]` 定时任务，确保 Cloudflare 将应用部署为 **带静态资产的完整 Worker** 而非仅静态资产 Worker，从而支持在 Cloudflare Dashboard (`Settings -> Variables and Secrets`) 中自由配置环境变量与密钥。
    - `worker.ts` 完整实现全部 `/api/*` 路由（`/api/health`、`/api/platform/db-config`、`/api/erp/*`、`/api/lingxing/mcp-proxy`、`/api/lingxing/scheduler/*`、`/api/mcp`）、`scheduled()` 定时同步与 `env.ASSETS.fetch()` 前端静态回落，严格执行 `AbortSignal.timeout`、外网 HTTPS 校验、HTTP 402 熔断与 `PLATFORM_SUPER_ADMIN` 隔离，且绝不向前端暴露 `SUPABASE_SERVICE_ROLE_KEY`。
+   - **Cloudflare Cron 跨实例状态持久化**：`lingxingAutoSyncRunner.ts` 在 `CLOUDFLARE_CRON` 运行模式下通过 `running = enabled && (timer !== null || runtimeMode === 'CLOUDFLARE_CRON')` 正确反馈运行状态，并将启停开关、同步间隔、同步模式及最近执行记录持久化至 Supabase `erp_domain_records` (`entity_type = 'schedulerState'`, `record_id = 'lingxing_auto_sync'`)；`worker.ts` 的 `scheduled()` 与 `/api/lingxing/scheduler/*` 路由自动读取环境变量配置与云端持久化状态，并按 `shouldRunCloudflareCronNow()` 精准执行启停与间隔控制。
 
 ---
 

@@ -23,11 +23,14 @@ import {
 } from '../../src/data/initialErpData';
 import {
   authenticateCredentials,
+  buildSessionCookieHeader,
   createSignedSessionToken,
+  extractSessionTokenFromCookie,
   hashPassword,
   resetAuthServiceStateForTest,
   setupInitialAdminAccount,
   verifyPassword,
+  verifyRequestAuth,
   verifySignedSessionToken,
 } from '../../src/services/authService';
 
@@ -390,15 +393,19 @@ export const dbAuthRbacAuditSuite: DomainAuditSuite = {
         }
 
         const appCode = ctx.readFile('src/App.tsx');
-        if (!/<LoginGateView\b/.test(appCode) || !/logoutAuthSession/.test(appCode)) {
+        if (
+          !/<LoginGateView\b/.test(appCode) ||
+          !/logoutAuthSession/.test(appCode) ||
+          !/fetchCurrentAuthUser/.test(appCode)
+        ) {
           violations.push({
             ruleId: 'AUTH-ADV-08',
             domain: DOMAIN,
             docPath: DOC_PATH,
-            title: 'src/App.tsx 未挂载 LoginGateView 登录门禁或缺少 logoutAuthSession 退出流',
-            historicalContext: '未登录用户严禁进入 ERP 主工作台，且必须提供完整登出清理入口。',
+            title: 'src/App.tsx 未挂载 LoginGateView 登录门禁、缺少 fetchCurrentAuthUser 刷新会话恢复或 logoutAuthSession 退出流',
+            historicalContext: '未登录用户严禁进入 ERP 主工作台，已登录用户刷新页面后必须通过 HttpOnly Cookie 自动恢复会话而非重复登录。',
             file: 'src/App.tsx',
-            remediation: '在 src/App.tsx 中对未认证状态渲染 <LoginGateView /> 并接入 logoutAuthSession。',
+            remediation: '在 src/App.tsx 中挂载 <LoginGateView />，启动时调用 fetchCurrentAuthUser 恢复会话，并接入 logoutAuthSession。',
           });
         }
 
@@ -657,6 +664,31 @@ export const dbAuthRbacAuditSuite: DomainAuditSuite = {
         }
       );
 
+      const httpsCookieHeader = buildSessionCookieHeader(minted.token, { isHttps: true });
+      const extractedCookieToken = extractSessionTokenFromCookie(httpsCookieHeader.split(';')[0]);
+      const cookieGetSession = await verifyRequestAuth(
+        {
+          cookieHeader: httpsCookieHeader.split(';')[0],
+          method: 'GET',
+        },
+        { AUTH_SESSION_SECRET: signingKey }
+      );
+      const cookiePostNoCsrf = await verifyRequestAuth(
+        {
+          cookieHeader: httpsCookieHeader.split(';')[0],
+          method: 'POST',
+        },
+        { AUTH_SESSION_SECRET: signingKey }
+      );
+      const cookiePostWithXhr = await verifyRequestAuth(
+        {
+          cookieHeader: httpsCookieHeader.split(';')[0],
+          method: 'POST',
+          requestedWithHeader: 'XMLHttpRequest',
+        },
+        { AUTH_SESSION_SECRET: signingKey }
+      );
+
       if (
         !hash.startsWith('pbkdf2_sha256$') ||
         !okPwd ||
@@ -670,16 +702,24 @@ export const dbAuthRbacAuditSuite: DomainAuditSuite = {
         secondClaim.status !== 409 ||
         !loginOk.ok ||
         loginBad.ok ||
-        loginBad.status !== 401
+        loginBad.status !== 401 ||
+        !httpsCookieHeader.includes('HttpOnly') ||
+        !httpsCookieHeader.includes('Secure') ||
+        !httpsCookieHeader.includes('SameSite=None') ||
+        !httpsCookieHeader.includes('Partitioned') ||
+        extractedCookieToken !== minted.token ||
+        cookieGetSession?.email !== 'admin@x-cloud-erp.example.com' ||
+        cookiePostNoCsrf !== null ||
+        cookiePostWithXhr?.email !== 'admin@x-cloud-erp.example.com'
       ) {
         violations.push({
           ruleId: 'AUTH-ADV-08',
           domain: DOMAIN,
           docPath: DOC_PATH,
-          title: '内存故障注入失败: 登录密码哈希、签名会话防篡改/过期校验或首次管理员注册锁定异常',
-          historicalContext: '登录认证引擎必须确保密码单向加盐校验、防伪造签名与一次性初始管理员注册锁定严格生效。',
+          title: '内存故障注入失败: 登录密码哈希、HttpOnly Cookie 刷新恢复、CSRF 防护或首次管理员注册锁定异常',
+          historicalContext: '登录认证引擎必须确保密码单向加盐校验、HttpOnly 签名 Cookie 刷新恢复、防伪造签名/CSRF 与一次性初始管理员注册锁定严格生效。',
           file: 'src/services/authService.ts',
-          remediation: '检查 hashPassword、verifyPassword、verifySignedSessionToken 与 setupInitialAdminAccount 实现。',
+          remediation: '检查 hashPassword、verifyPassword、buildSessionCookieHeader、verifyRequestAuth 与 setupInitialAdminAccount 实现。',
         });
       }
     } finally {

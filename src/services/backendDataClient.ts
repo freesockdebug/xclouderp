@@ -43,6 +43,7 @@ export async function fetchErpBootstrap(): Promise<BackendBootstrapResponse> {
   try {
     const res = await fetch('/api/erp/bootstrap', {
       method: 'GET',
+      credentials: 'include',
       headers: { Accept: 'application/json', ...getAuthHeaders() },
     });
     if (res.status === 401) {
@@ -85,6 +86,7 @@ export async function fetchErpPageData(params: {
   try {
     const res = await fetch('/api/erp/page-data', {
       method: 'POST',
+      credentials: 'include',
       headers: {
         'Content-Type': 'application/json',
         Accept: 'application/json',
@@ -141,6 +143,7 @@ export async function queryErpPagedData<T = unknown>(
   try {
     const res = await fetch('/api/erp/query', {
       method: 'POST',
+      credentials: 'include',
       headers: {
         'Content-Type': 'application/json',
         Accept: 'application/json',
@@ -196,6 +199,7 @@ export async function invalidateErpBackendCache(
   try {
     const res = await fetch('/api/erp/cache/invalidate', {
       method: 'POST',
+      credentials: 'include',
       headers: { 'Content-Type': 'application/json', ...getAuthHeaders() },
       body: JSON.stringify({ entityTypes, tenantId }),
     });

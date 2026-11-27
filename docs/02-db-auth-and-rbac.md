@@ -83,9 +83,9 @@ flowchart TD
 - **服务端登录验证与会话网关契约 (`/api/auth/*`)**：
   - `GET /api/auth/status`（公开）：返回 `needsInitialSetup`、`envAdminConfigured`、`authMode`，严禁返回密码哈希或签名密钥。
   - `POST /api/auth/setup-admin`（一次性公开）：当系统未配置 `ADMIN_LOGIN_PASSCODE` 且无管理员账号时允许初始化首位 `PLATFORM_SUPER_ADMIN`，完成后永久锁定并返回 HTTP `409 ALREADY_INITIALIZED`。
-  - `POST /api/auth/login`（公开）：依次校验服务端环境变量 `ADMIN_LOGIN_PASSCODE`、Supabase `erp_domain_records` (`entity_type = 'authAccounts'`) 的 PBKDF2-SHA256 哈希账号，以及可选的 Supabase Auth 密码签发接口，通过后签发 24h 有效 HMAC-SHA256 Bearer Token。
-  - `GET /api/auth/me`、`POST /api/auth/change-password`、`POST /api/auth/register-member` 及全部 `/api/erp/*`、`/api/lingxing/*`、`POST /api/platform/db-config` 接口均强制执行 `requireAuthenticatedSession`（未认证返回 HTTP `401 AUTH_REQUIRED`）。
-  - 前端 `authClient.ts` 仅在浏览器 JS/React 运行内存中保存 Bearer Token，严禁写入 `localStorage` 或 `sessionStorage`。
+  - `POST /api/auth/login`（公开）：依次校验服务端环境变量 `ADMIN_LOGIN_PASSCODE`、Supabase `erp_domain_records` (`entity_type = 'authAccounts'`) 的 PBKDF2-SHA256 哈希账号，以及可选的 Supabase Auth 密码签发接口，通过后签发 24h 有效 HMAC-SHA256 会话凭证并同步下发 `HttpOnly; Secure; SameSite=None; Partitioned` 签名 Cookie (`xcloud_session`)。
+  - `GET /api/auth/me`、`POST /api/auth/change-password`、`POST /api/auth/register-member` 及全部 `/api/erp/*`、`/api/lingxing/*`、`POST /api/platform/db-config` 接口均强制执行 `requireAuthenticatedSession`（支持 `Authorization: Bearer` 或签名 `HttpOnly` Cookie；Cookie 写请求强制校验 `X-Requested-With: XMLHttpRequest` 或同源 `Origin`，未认证返回 HTTP `401 AUTH_REQUIRED`）。
+  - 前端 `authClient.ts` 禁用 `localStorage` / `sessionStorage`，通过 `credentials: 'include'` 与 `GET /api/auth/me` 在页面刷新后无感恢复服务端签名 Cookie 会话，并在 `POST /api/auth/logout` 时以 `Max-Age=0` 立即清除 Cookie。
 
 ---
 
