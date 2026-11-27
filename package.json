@@ -7,6 +7,8 @@
     "dev": "tsx server.ts",
     "start": "node --import tsx server.ts",
     "build": "vite build",
+    "cf:deploy": "vite build && npx wrangler deploy",
+    "cf:dev": "vite build && npx wrangler dev",
     "preview": "vite preview",
     "clean": "rm -rf dist server.js",
     "check": "tsx scripts/check-preflight.ts",

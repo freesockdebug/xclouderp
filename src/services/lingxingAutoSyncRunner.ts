@@ -861,6 +861,7 @@ export function configureLingxingScheduler(opts: {
   syncMode?: LingxingSyncMode;
   orderLookbackDays?: number;
   enabled: boolean;
+  skipIntervalTimer?: boolean;
 }): LingxingSchedulerStatus {
   if (opts.supabaseUrl && opts.supabaseAnonKey) {
     const cleanUrl = normalizeSupabaseProjectUrl(opts.supabaseUrl);
@@ -911,9 +912,11 @@ export function configureLingxingScheduler(opts: {
               ? `智能增量 / 订单回溯 ${state.orderLookbackDays} 天`
               : `全量回溯 ${state.orderSyncDays} 天`
           }）`;
-    state.timer = setInterval(() => {
-      void runLingxingScheduledSyncOnce();
-    }, intervalMs);
+    if (!opts.skipIntervalTimer) {
+      state.timer = setInterval(() => {
+        void runLingxingScheduledSyncOnce();
+      }, intervalMs);
+    }
   } else {
     state.nextRunAt = null;
     if (!state.supabaseConfig) {
@@ -927,10 +930,11 @@ export function configureLingxingScheduler(opts: {
 }
 
 export function bootstrapLingxingSchedulerFromEnv(): void {
-  const url = process.env.SUPABASE_URL || process.env.VITE_SUPABASE_URL || '';
-  const key = process.env.SUPABASE_ANON_KEY || process.env.VITE_SUPABASE_ANON_KEY || '';
-  const interval = Number(process.env.LINGXING_SYNC_INTERVAL_MINUTES) || 15;
-  const orderDays = Number(process.env.LINGXING_ORDER_SYNC_DAYS) || DEFAULT_ORDER_SYNC_DAYS;
+  const env = typeof process !== 'undefined' && process.env ? process.env : {};
+  const url = env.SUPABASE_URL || env.VITE_SUPABASE_URL || '';
+  const key = env.SUPABASE_ANON_KEY || env.VITE_SUPABASE_ANON_KEY || '';
+  const interval = Number(env.LINGXING_SYNC_INTERVAL_MINUTES) || 15;
+  const orderDays = Number(env.LINGXING_ORDER_SYNC_DAYS) || DEFAULT_ORDER_SYNC_DAYS;
   if (url && key) {
     configureLingxingScheduler({
       supabaseUrl: url,

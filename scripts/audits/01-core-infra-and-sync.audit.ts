@@ -33,6 +33,10 @@ import {
   PAGE_ENTITY_REQUIREMENTS,
   executePagedEntityQuery,
 } from '../../src/services/backendDataEngine';
+import {
+  handleWorkerRequest,
+  resetWorkerRuntimeDbConfigForTest,
+} from '../../worker';
 
 const DOMAIN = '01-core-infra-and-sync';
 const DOC_PATH = 'docs/01-core-infra-and-sync.md';
@@ -43,6 +47,8 @@ export const coreInfraAuditSuite: DomainAuditSuite = {
   docPath: DOC_PATH,
   triggerPatterns: [
     /^server\.ts$/,
+    /^worker\.ts$/,
+    /^wrangler\.toml$/,
     /^src\/services\//,
     /^src\/components\/LingxingMcpConnectorView\.tsx$/,
     /^src\/components\/SupabaseSetupModal\.tsx$/,
@@ -830,6 +836,110 @@ export const coreInfraAuditSuite: DomainAuditSuite = {
         return violations;
       },
     },
+    {
+      id: 'INFRA-ADV-15',
+      domain: DOMAIN,
+      docPath: DOC_PATH,
+      title: 'Cloudflare Workers 全栈资产部署契约：wrangler.toml 必须声明 main = "worker.ts" + [assets] 解除“仅静态资产 Worker 不可加变量”限制，且 worker.ts 完整覆盖 /api/* 安全防线与超时约束',
+      historicalContext:
+        '缺少 wrangler.toml 与 worker.ts 入口时，Cloudflare 会将 Vite dist 部署为“只有静态资产的 Worker”，不仅在 Settings 添加环境变量/密钥时报错「不能将变量添加到只有静态资产的 Worker」，且所有 /api/* 后台接口均无法生效。',
+      remediation:
+        '保持根目录 wrangler.toml 声明 main = "worker.ts"、[assets] (directory="./dist", binding="ASSETS", run_worker_first=["/api/*"]) 且无硬编码密钥；保持 worker.ts 挂载全部 /api/* 路由、AbortSignal.timeout、validateSafeExternalMcpUrl、402 熔断、PLATFORM_SUPER_ADMIN 校验与 env.ASSETS.fetch 静态回落。',
+      check(ctx) {
+        const violations: AuditViolation[] = [];
+        if (!ctx.fileExists('wrangler.toml') || !ctx.fileExists('worker.ts')) {
+          return [
+            {
+              ruleId: 'INFRA-ADV-15',
+              domain: DOMAIN,
+              docPath: DOC_PATH,
+              title: '缺失根目录 wrangler.toml 或 worker.ts Cloudflare Workers 全栈入口文件',
+              historicalContext: '无 main Worker 入口会导致 Cloudflare 将项目识别为仅静态资产 Worker，无法配置环境变量且 /api/* 不可用。',
+              file: 'wrangler.toml',
+              remediation: '在仓库根目录提供 wrangler.toml (含 main = "worker.ts" 与 [assets]) 及 worker.ts 入口。',
+            },
+          ];
+        }
+        const wranglerCode = ctx.readFile('wrangler.toml');
+        const workerCode = ctx.readFile('worker.ts');
+
+        if (
+          !/main\s*=\s*["']worker\.ts["']/.test(wranglerCode) ||
+          !/\[assets\]/.test(wranglerCode) ||
+          !/directory\s*=\s*["']\.\/dist["']/.test(wranglerCode) ||
+          !/binding\s*=\s*["']ASSETS["']/.test(wranglerCode) ||
+          !/run_worker_first\s*=\s*\[\s*["']\/api\/\*["']\s*\]/.test(wranglerCode)
+        ) {
+          violations.push({
+            ruleId: 'INFRA-ADV-15',
+            domain: DOMAIN,
+            docPath: DOC_PATH,
+            title: 'wrangler.toml 缺失 main = "worker.ts" 或 [assets] / run_worker_first = ["/api/*"] 配置',
+            historicalContext: '必须声明 Worker 主脚本和 ASSETS 绑定以启用环境变量配置与 /api/* 动态路由。',
+            file: 'wrangler.toml',
+            remediation: '在 wrangler.toml 中保留 main = "worker.ts"、[assets] directory/binding/run_worker_first。',
+          });
+        }
+        if (/eyJhbGciOi[A-Za-z0-9_-]{10,}|https:\/\/[a-z0-9]{12,}\.supabase\.co/i.test(wranglerCode)) {
+          violations.push({
+            ruleId: 'INFRA-ADV-15',
+            domain: DOMAIN,
+            docPath: DOC_PATH,
+            title: 'wrangler.toml 中检测到硬编码真实 Supabase URL 或 JWT 密钥',
+            historicalContext: '生产数据库连接参数必须通过 Cloudflare Dashboard Variables and Secrets 注入。',
+            file: 'wrangler.toml',
+            remediation: '移除 wrangler.toml 中的真实密钥，仅在 Cloudflare Dashboard 中配置变量。',
+          });
+        }
+
+        const requiredWorkerChecks = [
+          '/api/platform/db-config',
+          '/api/erp/bootstrap',
+          '/api/erp/page-data',
+          '/api/erp/query',
+          '/api/lingxing/mcp-proxy',
+          '/api/mcp',
+          'env.ASSETS.fetch',
+          'PLATFORM_SUPER_ADMIN',
+          'validateSafeExternalMcpUrl',
+          'PAGE_ENTITY_REQUIREMENTS',
+          'ALLOWED_QUERY_ENTITIES',
+        ];
+        const missingInWorker = requiredWorkerChecks.filter((token) => !workerCode.includes(token));
+        if (missingInWorker.length > 0 || /SUPABASE_SERVICE_ROLE_KEY/.test(workerCode)) {
+          violations.push({
+            ruleId: 'INFRA-ADV-15',
+            domain: DOMAIN,
+            docPath: DOC_PATH,
+            title: `worker.ts 缺失关键路由/守卫 (${missingInWorker.join(', ')}) 或错误引用了 SUPABASE_SERVICE_ROLE_KEY`,
+            historicalContext: 'Cloudflare Worker 必须与 Express 网关保持完整的安全防线与 API 能力对等，且严禁暴露高危服务密钥。',
+            file: 'worker.ts',
+            remediation: '在 worker.ts 中保留全部 /api/* 路由、白名单守卫与 env.ASSETS.fetch 回落，且不引用 SUPABASE_SERVICE_ROLE_KEY。',
+          });
+        }
+
+        // Enforce AbortSignal.timeout on every external fetch in worker.ts
+        const fetchRegex = /await\s+fetch\s*\(/g;
+        let m: RegExpExecArray | null;
+        while ((m = fetchRegex.exec(workerCode)) !== null) {
+          const endSemi = workerCode.indexOf(';', m.index);
+          const stmt = workerCode.slice(m.index, endSemi > m.index ? endSemi : m.index + 600);
+          if (!/AbortSignal\.timeout|signal\s*:/.test(stmt)) {
+            violations.push({
+              ruleId: 'INFRA-ADV-15',
+              domain: DOMAIN,
+              docPath: DOC_PATH,
+              title: 'worker.ts 中外部 fetch 缺少刚性超时信号 (AbortSignal.timeout)',
+              historicalContext: 'Cloudflare Worker 外部网络调用必须绑定超时信号防止连接挂起耗尽并发槽位。',
+              file: 'worker.ts',
+              line: findLineNumber(workerCode, m.index),
+              remediation: '为 worker.ts 中的每次外部 fetch 添加 signal: AbortSignal.timeout(...)。',
+            });
+          }
+        }
+        return violations;
+      },
+    },
   ],
   async verify() {
     const violations: AuditViolation[] = [];
@@ -1528,6 +1638,85 @@ export const coreInfraAuditSuite: DomainAuditSuite = {
         file: 'src/services/backendDataEngine.ts',
         remediation: '检查 BOOTSTRAP_ENTITY_TYPES、PAGE_ENTITY_REQUIREMENTS 与 executePagedEntityQuery 实现。',
       });
+    }
+    // Memory fault injection for INFRA-ADV-15: Cloudflare Worker fetch handler parity & security guards
+    resetWorkerRuntimeDbConfigForTest();
+    try {
+      let assetFetchedPath = '';
+      const mockEnv = {
+        SUPABASE_URL: 'https://cf-worker-test.supabase.co/rest/v1/',
+        SUPABASE_ANON_KEY: 'sb_publishable_cf_worker_test',
+        SUPABASE_SERVICE_ROLE_KEY: 'secret_must_never_leak_to_client',
+        ASSETS: {
+          fetch: async (input: Request | string) => {
+            const reqUrl = typeof input === 'string' ? input : input.url;
+            assetFetchedPath = new URL(reqUrl).pathname;
+            return new Response('<html>SPA</html>', { status: 200 });
+          },
+        },
+      };
+      const cfgRes = await handleWorkerRequest(
+        new Request('https://xclouderp.example.workers.dev/api/platform/db-config'),
+        mockEnv
+      );
+      const cfgRaw = await cfgRes.text();
+      const cfgJson = JSON.parse(cfgRaw) as {
+        ok?: boolean;
+        configSource?: string;
+        config?: { projectUrl?: string; anonKey?: string };
+      };
+      const forbiddenPostRes = await handleWorkerRequest(
+        new Request('https://xclouderp.example.workers.dev/api/platform/db-config', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ portalMode: 'TENANT_WORKSPACE', projectUrl: 'https://a.supabase.co', anonKey: 'k' }),
+        }),
+        mockEnv
+      );
+      const expiredProxyRes = await handleWorkerRequest(
+        new Request('https://xclouderp.example.workers.dev/api/lingxing/mcp-proxy', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ tenantStatus: 'EXPIRED_READONLY', mcpEndpointUrl: 'https://openmcp.lingxing.com', mcpApiKey: 'k' }),
+        }),
+        mockEnv
+      );
+      const invalidPageRes = await handleWorkerRequest(
+        new Request('https://xclouderp.example.workers.dev/api/erp/page-data', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ pageId: '__invalid_page__' }),
+        }),
+        mockEnv
+      );
+      const spaRes = await handleWorkerRequest(
+        new Request('https://xclouderp.example.workers.dev/overview'),
+        mockEnv
+      );
+
+      if (
+        cfgRes.status !== 200 ||
+        cfgJson.configSource !== 'ENV' ||
+        cfgJson.config?.projectUrl !== 'https://cf-worker-test.supabase.co' ||
+        cfgRaw.includes('secret_must_never_leak_to_client') ||
+        forbiddenPostRes.status !== 403 ||
+        expiredProxyRes.status !== 402 ||
+        invalidPageRes.status !== 400 ||
+        spaRes.status !== 200 ||
+        assetFetchedPath !== '/overview'
+      ) {
+        violations.push({
+          ruleId: 'INFRA-ADV-15',
+          domain: DOMAIN,
+          docPath: DOC_PATH,
+          title: '内存故障注入失败: Cloudflare Worker 环境变量读取、安全隔离拦截或静态资源回落异常',
+          historicalContext: 'worker.ts 必须从 Cloudflare env 读取公开连接配置且绝不泄漏高危密钥，正确执行 403/402/400 防线并将前端路由委派至 env.ASSETS.fetch。',
+          file: 'worker.ts',
+          remediation: '检查 worker.ts 中的 handleWorkerRequest 实现。',
+        });
+      }
+    } finally {
+      resetWorkerRuntimeDbConfigForTest();
     }
     return violations;
   },

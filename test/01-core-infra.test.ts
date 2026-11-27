@@ -54,6 +54,10 @@ import {
   ALLOWED_QUERY_ENTITIES,
   executePagedEntityQuery,
 } from '../src/services/backendDataEngine';
+import {
+  handleWorkerRequest,
+  resetWorkerRuntimeDbConfigForTest,
+} from '../worker';
 
 test('01-core-infra: isTenantWritable allows ACTIVE/TRIALING/GRACE_PERIOD and blocks EXPIRED/SUSPENDED', () => {
   assert.equal(isTenantWritable({ subscriptionStatus: 'ACTIVE' }), true);
@@ -1358,6 +1362,128 @@ test('01-core-infra: silent bootstrap, per-page on-demand loading boundaries, an
   assert.match(appCode, /fetchErpPageData/);
   assert.match(appCode, /backendQueryContext=\{backendQueryContext\}/);
 });
+
+test('01-core-infra: Cloudflare Workers full-stack adapter (wrangler.toml + worker.ts) unlocks env variables, enforces API guards, and delegates SPA assets (INFRA-ADV-15)', async () => {
+  const wrangler = fs.readFileSync('wrangler.toml', 'utf8');
+  assert.match(wrangler, /name\s*=\s*"xclouderp"/);
+  assert.match(wrangler, /main\s*=\s*"worker\.ts"/);
+  assert.match(wrangler, /\[assets\]/);
+  assert.match(wrangler, /directory\s*=\s*"\.\/dist"/);
+  assert.match(wrangler, /binding\s*=\s*"ASSETS"/);
+  assert.match(wrangler, /run_worker_first\s*=\s*\["\/api\/\*"\]/);
+
+  resetWorkerRuntimeDbConfigForTest();
+  try {
+    let forwardedAssetPath = '';
+    const env = {
+      SUPABASE_URL: 'https://prod-cf.supabase.co/rest/v1/',
+      SUPABASE_ANON_KEY: 'sb_publishable_cf_prod_key',
+      SUPABASE_SERVICE_ROLE_KEY: 'super_secret_service_role_never_expose',
+      ASSETS: {
+        fetch: async (input: Request | string) => {
+          const urlStr = typeof input === 'string' ? input : input.url;
+          forwardedAssetPath = new URL(urlStr).pathname;
+          return new Response('<!doctype html><title>X Cloud ERP</title>', { status: 200 });
+        },
+      },
+    };
+
+    // 1) Health check & env-backed db-config without exposing service role key
+    const healthRes = await handleWorkerRequest(new Request('https://xclouderp.workers.dev/api/health'), env);
+    assert.equal(healthRes.status, 200);
+    const healthJson = (await healthRes.json()) as { ok: boolean; runtime: string; configSource: string };
+    assert.equal(healthJson.ok, true);
+    assert.equal(healthJson.runtime, 'cloudflare-workers');
+    assert.equal(healthJson.configSource, 'ENV');
+
+    const dbCfgRes = await handleWorkerRequest(
+      new Request('https://xclouderp.workers.dev/api/platform/db-config'),
+      env
+    );
+    const dbCfgText = await dbCfgRes.text();
+    assert.equal(dbCfgRes.status, 200);
+    assert.equal(dbCfgText.includes('super_secret_service_role_never_expose'), false);
+    const dbCfgJson = JSON.parse(dbCfgText) as { config: { projectUrl: string; anonKey: string }; configSource: string };
+    assert.equal(dbCfgJson.configSource, 'ENV');
+    assert.equal(dbCfgJson.config.projectUrl, 'https://prod-cf.supabase.co');
+    assert.equal(dbCfgJson.config.anonKey, 'sb_publishable_cf_prod_key');
+
+    // 2) Non-super-admin POST /api/platform/db-config blocked with 403
+    const nonAdminRes = await handleWorkerRequest(
+      new Request('https://xclouderp.workers.dev/api/platform/db-config', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ portalMode: 'TENANT_WORKSPACE', projectUrl: 'https://evil.supabase.co', anonKey: 'k' }),
+      }),
+      env
+    );
+    assert.equal(nonAdminRes.status, 403);
+
+    // 3) Lingxing proxy enforces 402 subscription guard and blocks private/loopback SSRF URLs
+    const expiredRes = await handleWorkerRequest(
+      new Request('https://xclouderp.workers.dev/api/lingxing/mcp-proxy', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          tenantStatus: 'EXPIRED_READONLY',
+          mcpEndpointUrl: 'https://openmcp.lingxing.com/mcp',
+          mcpApiKey: 'demo',
+        }),
+      }),
+      env
+    );
+    assert.equal(expiredRes.status, 402);
+
+    const ssrfRes = await handleWorkerRequest(
+      new Request('https://xclouderp.workers.dev/api/lingxing/mcp-proxy', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          tenantStatus: 'ACTIVE',
+          mcpEndpointUrl: 'https://169.254.169.254/latest/meta-data',
+          mcpApiKey: 'demo',
+        }),
+      }),
+      env
+    );
+    assert.equal(ssrfRes.status, 400);
+
+    // 4) /api/mcp guards & /api/erp/* allowlists + unknown /api/* 404
+    const unauthMcpRes = await handleWorkerRequest(
+      new Request('https://xclouderp.workers.dev/api/mcp', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ method: 'tools/list' }),
+      }),
+      env
+    );
+    assert.equal(unauthMcpRes.status, 401);
+
+    const badQueryRes = await handleWorkerRequest(
+      new Request('https://xclouderp.workers.dev/api/erp/query', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ entityType: '__forbidden__' }),
+      }),
+      env
+    );
+    assert.equal(badQueryRes.status, 400);
+
+    const notFoundApiRes = await handleWorkerRequest(
+      new Request('https://xclouderp.workers.dev/api/does-not-exist'),
+      env
+    );
+    assert.equal(notFoundApiRes.status, 404);
+
+    // 5) Non-API routes delegate to Cloudflare ASSETS binding
+    const spaRes = await handleWorkerRequest(new Request('https://xclouderp.workers.dev/amazon'), env);
+    assert.equal(spaRes.status, 200);
+    assert.equal(forwardedAssetPath, '/amazon');
+  } finally {
+    resetWorkerRuntimeDbConfigForTest();
+  }
+});
+
 
 
 

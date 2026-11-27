@@ -1,0 +1,30 @@
+# X Cloud ERP — Cloudflare Workers (Full-Stack Worker + Static Assets)
+# Declaring `main = "worker.ts"` ensures Cloudflare deploys a full Worker with Static Assets
+# instead of a static-assets-only Worker, enabling Environment Variables & Secrets in Dashboard
+# (Settings -> Variables and Secrets) as well as /api/* backend routes and Cron Triggers.
+
+name = "xclouderp"
+main = "worker.ts"
+compatibility_date = "2025-10-01"
+compatibility_flags = ["nodejs_compat"]
+
+[assets]
+directory = "./dist"
+binding = "ASSETS"
+not_found_handling = "single-page-application"
+run_worker_first = ["/api/*"]
+
+[triggers]
+crons = ["*/15 * * * *"]
+
+[observability]
+enabled = true
+
+# Configure secrets & environment variables in Cloudflare Dashboard:
+# Workers & Pages -> xclouderp -> Settings -> Variables and Secrets:
+#   - SUPABASE_URL          (e.g. https://<your-project>.supabase.co)
+#   - SUPABASE_ANON_KEY     (Supabase publishable / anon key)
+#   - AUTH_MODE             (optional: SUPABASE_AUTH | LOGTO_OIDC)
+#   - LOGTO_ENDPOINT        (optional)
+#   - LOGTO_APP_ID          (optional)
+#   - LINGXING_ORDER_SYNC_DAYS (optional, default: 90)
