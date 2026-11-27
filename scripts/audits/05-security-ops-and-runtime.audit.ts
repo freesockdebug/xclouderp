@@ -220,6 +220,18 @@ export const securityOpsRuntimeAuditSuite: DomainAuditSuite = {
             remediation: '在 wrangler.toml 顶层添加 keep_vars = true。',
           });
         }
+        const pkgRaw = ctx.readFile('package.json');
+        if (/"esbuild"\s*:\s*"\^0\.25\./.test(pkgRaw) || !/--legacy-peer-deps/.test(wf)) {
+          violations.push({
+            ruleId: 'SEC-ADV-05',
+            domain: DOMAIN,
+            docPath: DOC_PATH,
+            title: 'CI 依赖安装存在 Vite 8 与 esbuild ^0.25.x ERESOLVE 冲突风险',
+            historicalContext: 'vite@8.4+ 声明 peerOptional esbuild@^0.27.0 || ^0.28.0，若锁定 esbuild ^0.25.0 或未启用 --legacy-peer-deps 会导致 GitHub Actions npm install 直接失败。',
+            file: 'package.json',
+            remediation: '保持 esbuild >= ^0.27.0 并在 deploy-cloudflare.yml 使用 npm install --legacy-peer-deps。',
+          });
+        }
         return violations;
       },
     },
