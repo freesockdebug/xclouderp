@@ -19,6 +19,16 @@ import {
   fetchPageDataFromSupabase,
   invalidateBackendEntityCache,
 } from './src/services/backendDataEngine';
+import {
+  authenticateCredentials,
+  changeAccountPassword,
+  getAuthStatus,
+  setupInitialAdminAccount,
+  upsertMemberLoginAccount,
+  verifyRequestBearerAuth,
+  type AuthEnvVars,
+  type AuthSessionUser,
+} from './src/services/authService';
 import type { ErpEntityType } from './src/services/erpDatabaseService';
 import type { ExchangeRateItem } from './src/types/erp';
 
@@ -33,11 +43,239 @@ async function startServer() {
 
   app.use(express.json({ limit: '5mb' }));
 
+  interface ServerPlatformDbConfig {
+    projectUrl: string;
+    anonKey: string;
+    authMode: 'SUPABASE_AUTH' | 'LOGTO_OIDC';
+    logtoEndpoint: string;
+    logtoAppId: string;
+  }
+
+  let runtimeServerDbConfig: ServerPlatformDbConfig | null = null;
+
+  const isValidConfiguredPair = (url: string, key: string): boolean =>
+    Boolean(
+      url &&
+        key &&
+        url.startsWith('https://') &&
+        !url.includes('your-project-id') &&
+        !key.includes('your-supabase-anon-key') &&
+        !key.includes('your_supabase_anon_key')
+    );
+
+  const getEffectiveServerDbConfig = (): {
+    config: ServerPlatformDbConfig;
+    configSource: 'ENV' | 'SERVER_MEMORY' | 'UNCONFIGURED';
+  } => {
+    const envUrl = normalizeSupabaseProjectUrl(
+      process.env.SUPABASE_URL || process.env.VITE_SUPABASE_URL || ''
+    );
+    const envKey = (process.env.SUPABASE_ANON_KEY || process.env.VITE_SUPABASE_ANON_KEY || '').trim();
+    const envAuthMode: 'SUPABASE_AUTH' | 'LOGTO_OIDC' =
+      process.env.AUTH_MODE === 'LOGTO_OIDC' ? 'LOGTO_OIDC' : 'SUPABASE_AUTH';
+    const envLogtoEndpoint = (
+      process.env.LOGTO_ENDPOINT ||
+      process.env.VITE_LOGTO_ENDPOINT ||
+      'https://auth.x-cloud-erp.example.com'
+    ).trim();
+    const envLogtoAppId = (
+      process.env.LOGTO_APP_ID ||
+      process.env.VITE_LOGTO_APP_ID ||
+      'app_xcloud_b2b_orgs'
+    ).trim();
+
+    if (runtimeServerDbConfig && isValidConfiguredPair(runtimeServerDbConfig.projectUrl, runtimeServerDbConfig.anonKey)) {
+      return {
+        config: runtimeServerDbConfig,
+        configSource: 'SERVER_MEMORY',
+      };
+    }
+
+    if (isValidConfiguredPair(envUrl, envKey)) {
+      return {
+        config: {
+          projectUrl: envUrl,
+          anonKey: envKey,
+          authMode: envAuthMode,
+          logtoEndpoint: envLogtoEndpoint,
+          logtoAppId: envLogtoAppId,
+        },
+        configSource: 'ENV',
+      };
+    }
+
+    return {
+      config: {
+        projectUrl: '',
+        anonKey: '',
+        authMode: runtimeServerDbConfig?.authMode || envAuthMode,
+        logtoEndpoint: runtimeServerDbConfig?.logtoEndpoint || envLogtoEndpoint,
+        logtoAppId: runtimeServerDbConfig?.logtoAppId || envLogtoAppId,
+      },
+      configSource: 'UNCONFIGURED',
+    };
+  };
+
+  const getAuthEnv = (): AuthEnvVars => ({
+    AUTH_SESSION_SECRET: process.env.AUTH_SESSION_SECRET,
+    ADMIN_LOGIN_EMAIL: process.env.ADMIN_LOGIN_EMAIL,
+    ADMIN_LOGIN_PASSCODE: process.env.ADMIN_LOGIN_PASSCODE,
+    AUTH_MODE: process.env.AUTH_MODE,
+  });
+
+  const requireAuthenticatedSession = async (
+    req: express.Request,
+    res: express.Response
+  ): Promise<AuthSessionUser | null> => {
+    const { config } = getEffectiveServerDbConfig();
+    const session = await verifyRequestBearerAuth(
+      req.headers.authorization,
+      getAuthEnv(),
+      config
+    );
+    if (!session) {
+      res.status(401).json({
+        ok: false,
+        errorCode: 'AUTH_REQUIRED',
+        message: '未登录或会话已过期，请先完成身份验证。',
+      });
+      return null;
+    }
+    return session;
+  };
+
+  // ============================================================================
+  // 0. HEALTH & AUTHENTICATION GATEWAY (/api/health, /api/auth/*)
+  // ============================================================================
+  app.get('/api/health', (_req, res) => {
+    const { configSource } = getEffectiveServerDbConfig();
+    return res.status(200).json({
+      ok: true,
+      runtime: 'node-express',
+      configSource,
+    });
+  });
+
+  app.get('/api/auth/status', async (_req, res) => {
+    const { config } = getEffectiveServerDbConfig();
+    const status = await getAuthStatus(getAuthEnv(), config);
+    return res.status(200).json({ ok: true, ...status });
+  });
+
+  app.post('/api/auth/setup-admin', async (req, res) => {
+    const { email = '', fullName = '', password = '' } = req.body || {};
+    const { config } = getEffectiveServerDbConfig();
+    const result = await setupInitialAdminAccount(getAuthEnv(), config, {
+      email: typeof email === 'string' ? email : '',
+      fullName: typeof fullName === 'string' ? fullName : '',
+      password: typeof password === 'string' ? password : '',
+    });
+    if (!result.ok) {
+      return res.status(result.status).json({
+        ok: false,
+        errorCode: result.errorCode,
+        message: result.message,
+      });
+    }
+    return res.status(200).json({
+      ok: true,
+      token: result.token,
+      expiresAt: result.expiresAt,
+      user: result.user,
+      persistedToDb: result.persistedToDb,
+    });
+  });
+
+  app.post('/api/auth/login', async (req, res) => {
+    const { email = '', password = '' } = req.body || {};
+    const { config } = getEffectiveServerDbConfig();
+    const result = await authenticateCredentials(getAuthEnv(), config, {
+      email: typeof email === 'string' ? email : '',
+      password: typeof password === 'string' ? password : '',
+    });
+    if (!result.ok) {
+      return res.status(result.status).json({
+        ok: false,
+        errorCode: result.errorCode,
+        message: result.message,
+      });
+    }
+    return res.status(200).json({
+      ok: true,
+      token: result.token,
+      expiresAt: result.expiresAt,
+      user: result.user,
+    });
+  });
+
+  app.post('/api/auth/logout', (_req, res) => {
+    return res.status(200).json({ ok: true });
+  });
+
+  app.get('/api/auth/me', async (req, res) => {
+    const session = await requireAuthenticatedSession(req, res);
+    if (!session) return;
+    return res.status(200).json({ ok: true, user: session });
+  });
+
+  app.post('/api/auth/change-password', async (req, res) => {
+    const session = await requireAuthenticatedSession(req, res);
+    if (!session) return;
+    const { currentPassword = '', newPassword = '' } = req.body || {};
+    const { config } = getEffectiveServerDbConfig();
+    const result = await changeAccountPassword(getAuthEnv(), config, session, {
+      currentPassword: typeof currentPassword === 'string' ? currentPassword : '',
+      newPassword: typeof newPassword === 'string' ? newPassword : '',
+    });
+    if (!result.ok) {
+      return res.status(result.status).json({
+        ok: false,
+        errorCode: result.errorCode,
+        message: result.message,
+      });
+    }
+    return res.status(200).json({
+      ok: true,
+      token: result.token,
+      expiresAt: result.expiresAt,
+      message: result.message,
+    });
+  });
+
+  app.post('/api/auth/register-member', async (req, res) => {
+    const session = await requireAuthenticatedSession(req, res);
+    if (!session) return;
+    const { email = '', fullName = '', password = '', role, tenantId, memberId } = req.body || {};
+    const { config } = getEffectiveServerDbConfig();
+    const result = await upsertMemberLoginAccount(getAuthEnv(), config, session, {
+      email: typeof email === 'string' ? email : '',
+      fullName: typeof fullName === 'string' ? fullName : '',
+      password: typeof password === 'string' ? password : '',
+      role: role === 'PLATFORM_SUPER_ADMIN' ? 'PLATFORM_SUPER_ADMIN' : 'TENANT_USER',
+      tenantId: typeof tenantId === 'string' ? tenantId : undefined,
+      memberId: typeof memberId === 'string' ? memberId : undefined,
+    });
+    if (!result.ok) {
+      return res.status(result.status).json({
+        ok: false,
+        errorCode: result.errorCode,
+        message: result.message,
+      });
+    }
+    return res.status(200).json({
+      ok: true,
+      user: result.user,
+      persistedToDb: result.persistedToDb,
+    });
+  });
+
   // ============================================================================
   // 1. UPSTREAM LINGXING MCP PROXY (/api/lingxing/mcp-proxy)
   // Bridges browser/Cloudflare Worker to Lingxing ERP MCP Server (Streamable HTTP + SSE)
   // ============================================================================
   app.post('/api/lingxing/mcp-proxy', async (req, res) => {
+    const session = await requireAuthenticatedSession(req, res);
+    if (!session) return;
     const startTime = Date.now();
     const {
       mcpEndpointUrl,
@@ -471,14 +709,18 @@ async function startServer() {
   // 3. SERVER-SIDE SCHEDULED LINGXING MCP AUTO-SYNC ENGINE (/api/lingxing/scheduler/*)
   // Runs periodic 11-domain real Lingxing OpenMCP sync directly into Supabase
   // ============================================================================
-  app.get('/api/lingxing/scheduler/status', (_req, res) => {
+  app.get('/api/lingxing/scheduler/status', async (req, res) => {
+    const session = await requireAuthenticatedSession(req, res);
+    if (!session) return;
     return res.status(200).json({
       ok: true,
       scheduler: getLingxingSchedulerStatus(),
     });
   });
 
-  app.post('/api/lingxing/scheduler/configure', (req, res) => {
+  app.post('/api/lingxing/scheduler/configure', async (req, res) => {
+    const session = await requireAuthenticatedSession(req, res);
+    if (!session) return;
     const {
       supabaseUrl,
       supabaseAnonKey,
@@ -531,6 +773,8 @@ async function startServer() {
   });
 
   app.post('/api/lingxing/scheduler/trigger', async (req, res) => {
+    const session = await requireAuthenticatedSession(req, res);
+    if (!session) return;
     const { tenantStatus = 'ACTIVE', orderSyncDays, syncMode } = req.body || {};
     if (tenantStatus === 'EXPIRED_READONLY' || tenantStatus === 'SUSPENDED') {
       return res.status(402).json({
@@ -555,79 +799,6 @@ async function startServer() {
   // Browser localStorage persistence for DB config is disabled.
   // Reads process.env first, falling back to Express runtime memory (never written to disk).
   // ============================================================================
-  interface ServerPlatformDbConfig {
-    projectUrl: string;
-    anonKey: string;
-    authMode: 'SUPABASE_AUTH' | 'LOGTO_OIDC';
-    logtoEndpoint: string;
-    logtoAppId: string;
-  }
-
-  let runtimeServerDbConfig: ServerPlatformDbConfig | null = null;
-
-  const isValidConfiguredPair = (url: string, key: string): boolean =>
-    Boolean(
-      url &&
-        key &&
-        url.startsWith('https://') &&
-        !url.includes('your-project-id') &&
-        !key.includes('your-supabase-anon-key') &&
-        !key.includes('your_supabase_anon_key')
-    );
-
-  const getEffectiveServerDbConfig = (): {
-    config: ServerPlatformDbConfig;
-    configSource: 'ENV' | 'SERVER_MEMORY' | 'UNCONFIGURED';
-  } => {
-    const envUrl = normalizeSupabaseProjectUrl(
-      process.env.SUPABASE_URL || process.env.VITE_SUPABASE_URL || ''
-    );
-    const envKey = (process.env.SUPABASE_ANON_KEY || process.env.VITE_SUPABASE_ANON_KEY || '').trim();
-    const envAuthMode: 'SUPABASE_AUTH' | 'LOGTO_OIDC' =
-      process.env.AUTH_MODE === 'LOGTO_OIDC' ? 'LOGTO_OIDC' : 'SUPABASE_AUTH';
-    const envLogtoEndpoint = (
-      process.env.LOGTO_ENDPOINT ||
-      process.env.VITE_LOGTO_ENDPOINT ||
-      'https://auth.x-cloud-erp.example.com'
-    ).trim();
-    const envLogtoAppId = (
-      process.env.LOGTO_APP_ID ||
-      process.env.VITE_LOGTO_APP_ID ||
-      'app_xcloud_b2b_orgs'
-    ).trim();
-
-    if (runtimeServerDbConfig && isValidConfiguredPair(runtimeServerDbConfig.projectUrl, runtimeServerDbConfig.anonKey)) {
-      return {
-        config: runtimeServerDbConfig,
-        configSource: 'SERVER_MEMORY',
-      };
-    }
-
-    if (isValidConfiguredPair(envUrl, envKey)) {
-      return {
-        config: {
-          projectUrl: envUrl,
-          anonKey: envKey,
-          authMode: envAuthMode,
-          logtoEndpoint: envLogtoEndpoint,
-          logtoAppId: envLogtoAppId,
-        },
-        configSource: 'ENV',
-      };
-    }
-
-    return {
-      config: {
-        projectUrl: '',
-        anonKey: '',
-        authMode: runtimeServerDbConfig?.authMode || envAuthMode,
-        logtoEndpoint: runtimeServerDbConfig?.logtoEndpoint || envLogtoEndpoint,
-        logtoAppId: runtimeServerDbConfig?.logtoAppId || envLogtoAppId,
-      },
-      configSource: 'UNCONFIGURED',
-    };
-  };
-
   app.get('/api/platform/db-config', (_req, res) => {
     const { config, configSource } = getEffectiveServerDbConfig();
     return res.status(200).json({
@@ -637,7 +808,9 @@ async function startServer() {
     });
   });
 
-  app.post('/api/platform/db-config', (req, res) => {
+  app.post('/api/platform/db-config', async (req, res) => {
+    const session = await requireAuthenticatedSession(req, res);
+    if (!session) return;
     const {
       portalMode,
       projectUrl = '',
@@ -647,7 +820,7 @@ async function startServer() {
       logtoAppId = 'app_xcloud_b2b_orgs',
     } = req.body || {};
 
-    if (portalMode !== 'PLATFORM_SUPER_ADMIN') {
+    if (session.role !== 'PLATFORM_SUPER_ADMIN' || portalMode !== 'PLATFORM_SUPER_ADMIN') {
       return res.status(403).json({
         ok: false,
         errorCode: 'SUPER_ADMIN_ONLY',
@@ -728,7 +901,9 @@ async function startServer() {
   // 5. ON-DEMAND BACKEND DATA & SERVER PAGINATION (/api/erp/*)
   // Keeps full datasets in backend/database; serves only current page & page slice.
   // ============================================================================
-  app.get('/api/erp/bootstrap', async (_req, res) => {
+  app.get('/api/erp/bootstrap', async (req, res) => {
+    const session = await requireAuthenticatedSession(req, res);
+    if (!session) return;
     const startTime = Date.now();
     const { config } = getEffectiveServerDbConfig();
     const result = await fetchBootstrapFromSupabase(config);
@@ -743,6 +918,8 @@ async function startServer() {
   });
 
   app.post('/api/erp/page-data', async (req, res) => {
+    const session = await requireAuthenticatedSession(req, res);
+    if (!session) return;
     const startTime = Date.now();
     const {
       pageId = '',
@@ -761,11 +938,18 @@ async function startServer() {
       });
     }
 
+    const effectiveTenantId =
+      session.role !== 'PLATFORM_SUPER_ADMIN' && session.tenantId
+        ? session.tenantId
+        : typeof tenantId === 'string'
+        ? tenantId.trim()
+        : undefined;
+
     const { config } = getEffectiveServerDbConfig();
     const result = await fetchPageDataFromSupabase({
       config,
       pageId: cleanPageId,
-      tenantId: typeof tenantId === 'string' ? tenantId.trim() : undefined,
+      tenantId: effectiveTenantId,
       roleCode: typeof roleCode === 'string' ? roleCode.trim() : undefined,
       allowedShopIds: Array.isArray(allowedShopIds)
         ? allowedShopIds.filter((s): s is string => typeof s === 'string')
@@ -779,6 +963,8 @@ async function startServer() {
   });
 
   app.post('/api/erp/query', async (req, res) => {
+    const session = await requireAuthenticatedSession(req, res);
+    if (!session) return;
     const startTime = Date.now();
     const {
       entityType = '',
@@ -801,7 +987,12 @@ async function startServer() {
     }
 
     const { config } = getEffectiveServerDbConfig();
-    const cleanTenantId = typeof tenantId === 'string' ? tenantId.trim() : undefined;
+    const cleanTenantId =
+      session.role !== 'PLATFORM_SUPER_ADMIN' && session.tenantId
+        ? session.tenantId
+        : typeof tenantId === 'string'
+        ? tenantId.trim()
+        : undefined;
     const sliceRes = await fetchEntitySliceFromSupabase(config, cleanEntity, cleanTenantId);
     if (sliceRes.status !== 'LOADED') {
       return res.status(200).json({
@@ -846,7 +1037,9 @@ async function startServer() {
     });
   });
 
-  app.post('/api/erp/cache/invalidate', (req, res) => {
+  app.post('/api/erp/cache/invalidate', async (req, res) => {
+    const session = await requireAuthenticatedSession(req, res);
+    if (!session) return;
     const { entityTypes, tenantId } = req.body || {};
     const validTypes = Array.isArray(entityTypes)
       ? entityTypes.filter((t): t is ErpEntityType => typeof t === 'string')

@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useCallback } from 'react';
+import { getAuthHeaders, notifyUnauthorized } from '../services/authClient';
 import {
   Tenant,
   AmazonShop,
@@ -238,7 +239,13 @@ export const LingxingMcpConnectorView: React.FC<LingxingMcpConnectorViewProps> =
 
   const fetchSchedulerStatus = useCallback(async () => {
     try {
-      const res = await fetch('/api/lingxing/scheduler/status');
+      const res = await fetch('/api/lingxing/scheduler/status', {
+        headers: { Accept: 'application/json', ...getAuthHeaders() },
+      });
+      if (res.status === 401) {
+        notifyUnauthorized();
+        return;
+      }
       const data = await res.json();
       if (data?.scheduler) {
         setScheduler(data.scheduler);
@@ -273,7 +280,7 @@ export const LingxingMcpConnectorView: React.FC<LingxingMcpConnectorViewProps> =
       const targetMode = overrideSyncMode ?? syncMode;
       const res = await fetch('/api/lingxing/scheduler/configure', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', ...getAuthHeaders() },
         body: JSON.stringify({
           supabaseUrl: supabaseConfig?.projectUrl,
           supabaseAnonKey: supabaseConfig?.anonKey,
@@ -285,6 +292,10 @@ export const LingxingMcpConnectorView: React.FC<LingxingMcpConnectorViewProps> =
           tenantStatus: currentTenant.subscriptionStatus,
         }),
       });
+      if (res.status === 401) {
+        notifyUnauthorized();
+        return;
+      }
       const data = await res.json();
       if (data?.scheduler) {
         setScheduler(data.scheduler);
@@ -317,7 +328,7 @@ export const LingxingMcpConnectorView: React.FC<LingxingMcpConnectorViewProps> =
       if (!scheduler?.supabaseConfigured && supabaseConfig?.projectUrl && supabaseConfig?.anonKey) {
         await fetch('/api/lingxing/scheduler/configure', {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: { 'Content-Type': 'application/json', ...getAuthHeaders() },
           body: JSON.stringify({
             supabaseUrl: supabaseConfig.projectUrl,
             supabaseAnonKey: supabaseConfig.anonKey,
@@ -332,13 +343,17 @@ export const LingxingMcpConnectorView: React.FC<LingxingMcpConnectorViewProps> =
       }
       const res = await fetch('/api/lingxing/scheduler/trigger', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', ...getAuthHeaders() },
         body: JSON.stringify({
           tenantStatus: currentTenant.subscriptionStatus,
           orderSyncDays,
           syncMode,
         }),
       });
+      if (res.status === 401) {
+        notifyUnauthorized();
+        return;
+      }
       const data = await res.json();
       if (data?.scheduler) {
         setScheduler(data.scheduler);
@@ -364,7 +379,7 @@ export const LingxingMcpConnectorView: React.FC<LingxingMcpConnectorViewProps> =
   }) => {
     const res = await fetch('/api/lingxing/mcp-proxy', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', ...getAuthHeaders() },
       body: JSON.stringify({
         mcpEndpointUrl: mcpUrl.trim(),
         mcpApiKey: mcpKey.trim(),
@@ -376,6 +391,9 @@ export const LingxingMcpConnectorView: React.FC<LingxingMcpConnectorViewProps> =
         mcpModuleEnabled,
       }),
     });
+    if (res.status === 401) {
+      notifyUnauthorized();
+    }
     const data = await res.json();
     if (typeof data.mcpSessionId === 'string' && data.mcpSessionId) {
       setMcpSessionId(data.mcpSessionId);

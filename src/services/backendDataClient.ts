@@ -3,6 +3,7 @@ import type {
   PagedEntityQueryInput,
   PagedEntityQueryResult,
 } from './backendDataEngine';
+import { getAuthHeaders, notifyUnauthorized } from './authClient';
 
 export interface BackendBootstrapResponse {
   ok: boolean;
@@ -42,8 +43,18 @@ export async function fetchErpBootstrap(): Promise<BackendBootstrapResponse> {
   try {
     const res = await fetch('/api/erp/bootstrap', {
       method: 'GET',
-      headers: { Accept: 'application/json' },
+      headers: { Accept: 'application/json', ...getAuthHeaders() },
     });
+    if (res.status === 401) {
+      notifyUnauthorized();
+      return {
+        ok: false,
+        status: 'ERROR',
+        message: '登录会话已失效，请重新登录。',
+        recordCount: 0,
+        data: {},
+      };
+    }
     const data = await res.json();
     return {
       ok: Boolean(data?.ok),
@@ -74,7 +85,11 @@ export async function fetchErpPageData(params: {
   try {
     const res = await fetch('/api/erp/page-data', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+      headers: {
+        'Content-Type': 'application/json',
+        Accept: 'application/json',
+        ...getAuthHeaders(),
+      },
       body: JSON.stringify({
         pageId: params.pageId,
         tenantId: params.tenantId,
@@ -83,6 +98,17 @@ export async function fetchErpPageData(params: {
       }),
       signal: params.signal,
     });
+    if (res.status === 401) {
+      notifyUnauthorized();
+      return {
+        ok: false,
+        status: 'ERROR',
+        message: '登录会话已失效，请重新登录。',
+        pageId: params.pageId,
+        requiredEntities: [],
+        data: {},
+      };
+    }
     const data = await res.json();
     return {
       ok: Boolean(data?.ok),
@@ -115,10 +141,27 @@ export async function queryErpPagedData<T = unknown>(
   try {
     const res = await fetch('/api/erp/query', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+      headers: {
+        'Content-Type': 'application/json',
+        Accept: 'application/json',
+        ...getAuthHeaders(),
+      },
       body: JSON.stringify(body),
       signal,
     });
+    if (res.status === 401) {
+      notifyUnauthorized();
+      return {
+        ok: false,
+        entityType: params.entityType,
+        page: params.page || 1,
+        pageSize: params.pageSize || 20,
+        totalItems: 0,
+        totalPages: 1,
+        items: [],
+        message: '登录会话已失效，请重新登录。',
+      };
+    }
     const data = await res.json();
     return {
       ok: Boolean(data?.ok),
@@ -151,11 +194,14 @@ export async function invalidateErpBackendCache(
   tenantId?: string
 ): Promise<void> {
   try {
-    await fetch('/api/erp/cache/invalidate', {
+    const res = await fetch('/api/erp/cache/invalidate', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', ...getAuthHeaders() },
       body: JSON.stringify({ entityTypes, tenantId }),
     });
+    if (res.status === 401) {
+      notifyUnauthorized();
+    }
   } catch {
     // Best-effort cache invalidation
   }

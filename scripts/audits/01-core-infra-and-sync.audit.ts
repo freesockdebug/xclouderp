@@ -37,6 +37,7 @@ import {
   handleWorkerRequest,
   resetWorkerRuntimeDbConfigForTest,
 } from '../../worker';
+import { createSignedSessionToken } from '../../src/services/authService';
 
 const DOMAIN = '01-core-infra-and-sync';
 const DOC_PATH = 'docs/01-core-infra-and-sync.md';
@@ -1643,10 +1644,12 @@ export const coreInfraAuditSuite: DomainAuditSuite = {
     resetWorkerRuntimeDbConfigForTest();
     try {
       let assetFetchedPath = '';
+      const workerTestSecret = 'infra_adv_15_worker_session_secret_32b';
       const mockEnv = {
         SUPABASE_URL: 'https://cf-worker-test.supabase.co/rest/v1/',
         SUPABASE_ANON_KEY: 'sb_publishable_cf_worker_test',
         SUPABASE_SERVICE_ROLE_KEY: 'secret_must_never_leak_to_client',
+        AUTH_SESSION_SECRET: workerTestSecret,
         ASSETS: {
           fetch: async (input: Request | string) => {
             const reqUrl = typeof input === 'string' ? input : input.url;
@@ -1654,6 +1657,21 @@ export const coreInfraAuditSuite: DomainAuditSuite = {
             return new Response('<html>SPA</html>', { status: 200 });
           },
         },
+      };
+      const signed = await createSignedSessionToken(
+        {
+          id: 'usr-infra-15',
+          email: 'admin@x-cloud-erp.example.com',
+          fullName: 'Audit Admin',
+          role: 'PLATFORM_SUPER_ADMIN',
+          authProvider: 'LOCAL_DB',
+        },
+        workerTestSecret,
+        3600
+      );
+      const authHeaders = {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${signed.token}`,
       };
       const cfgRes = await handleWorkerRequest(
         new Request('https://xclouderp.example.workers.dev/api/platform/db-config'),
@@ -1665,10 +1683,18 @@ export const coreInfraAuditSuite: DomainAuditSuite = {
         configSource?: string;
         config?: { projectUrl?: string; anonKey?: string };
       };
+      const unauthPageRes = await handleWorkerRequest(
+        new Request('https://xclouderp.example.workers.dev/api/erp/page-data', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ pageId: 'overview' }),
+        }),
+        mockEnv
+      );
       const forbiddenPostRes = await handleWorkerRequest(
         new Request('https://xclouderp.example.workers.dev/api/platform/db-config', {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: authHeaders,
           body: JSON.stringify({ portalMode: 'TENANT_WORKSPACE', projectUrl: 'https://a.supabase.co', anonKey: 'k' }),
         }),
         mockEnv
@@ -1676,7 +1702,7 @@ export const coreInfraAuditSuite: DomainAuditSuite = {
       const expiredProxyRes = await handleWorkerRequest(
         new Request('https://xclouderp.example.workers.dev/api/lingxing/mcp-proxy', {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: authHeaders,
           body: JSON.stringify({ tenantStatus: 'EXPIRED_READONLY', mcpEndpointUrl: 'https://openmcp.lingxing.com', mcpApiKey: 'k' }),
         }),
         mockEnv
@@ -1684,7 +1710,7 @@ export const coreInfraAuditSuite: DomainAuditSuite = {
       const invalidPageRes = await handleWorkerRequest(
         new Request('https://xclouderp.example.workers.dev/api/erp/page-data', {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: authHeaders,
           body: JSON.stringify({ pageId: '__invalid_page__' }),
         }),
         mockEnv
@@ -1699,6 +1725,7 @@ export const coreInfraAuditSuite: DomainAuditSuite = {
         cfgJson.configSource !== 'ENV' ||
         cfgJson.config?.projectUrl !== 'https://cf-worker-test.supabase.co' ||
         cfgRaw.includes('secret_must_never_leak_to_client') ||
+        unauthPageRes.status !== 401 ||
         forbiddenPostRes.status !== 403 ||
         expiredProxyRes.status !== 402 ||
         invalidPageRes.status !== 400 ||
@@ -1710,7 +1737,7 @@ export const coreInfraAuditSuite: DomainAuditSuite = {
           domain: DOMAIN,
           docPath: DOC_PATH,
           title: '内存故障注入失败: Cloudflare Worker 环境变量读取、安全隔离拦截或静态资源回落异常',
-          historicalContext: 'worker.ts 必须从 Cloudflare env 读取公开连接配置且绝不泄漏高危密钥，正确执行 403/402/400 防线并将前端路由委派至 env.ASSETS.fetch。',
+          historicalContext: 'worker.ts 必须从 Cloudflare env 读取公开连接配置且绝不泄漏高危密钥，正确执行 401/403/402/400 防线并将前端路由委派至 env.ASSETS.fetch。',
           file: 'worker.ts',
           remediation: '检查 worker.ts 中的 handleWorkerRequest 实现。',
         });

@@ -48,6 +48,7 @@ import {
   mergeSyncedEntities,
 } from '../src/services/lingxingMcpSync';
 import { getLingxingSchedulerStatus } from '../src/services/lingxingAutoSyncRunner';
+import { createSignedSessionToken } from '../src/services/authService';
 import {
   BOOTSTRAP_ENTITY_TYPES,
   PAGE_ENTITY_REQUIREMENTS,
@@ -1375,10 +1376,12 @@ test('01-core-infra: Cloudflare Workers full-stack adapter (wrangler.toml + work
   resetWorkerRuntimeDbConfigForTest();
   try {
     let forwardedAssetPath = '';
+    const testSecret = 'cf_worker_unit_test_secret_32bytes_min';
     const env = {
       SUPABASE_URL: 'https://prod-cf.supabase.co/rest/v1/',
       SUPABASE_ANON_KEY: 'sb_publishable_cf_prod_key',
       SUPABASE_SERVICE_ROLE_KEY: 'super_secret_service_role_never_expose',
+      AUTH_SESSION_SECRET: testSecret,
       ASSETS: {
         fetch: async (input: Request | string) => {
           const urlStr = typeof input === 'string' ? input : input.url;
@@ -1386,6 +1389,21 @@ test('01-core-infra: Cloudflare Workers full-stack adapter (wrangler.toml + work
           return new Response('<!doctype html><title>X Cloud ERP</title>', { status: 200 });
         },
       },
+    };
+    const signedAdmin = await createSignedSessionToken(
+      {
+        id: 'usr-cf-admin',
+        email: 'admin@x-cloud-erp.example.com',
+        fullName: 'CF Admin',
+        role: 'PLATFORM_SUPER_ADMIN',
+        authProvider: 'LOCAL_DB',
+      },
+      testSecret,
+      3600
+    );
+    const authHeaders = {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${signedAdmin.token}`,
     };
 
     // 1) Health check & env-backed db-config without exposing service role key
@@ -1408,11 +1426,21 @@ test('01-core-infra: Cloudflare Workers full-stack adapter (wrangler.toml + work
     assert.equal(dbCfgJson.config.projectUrl, 'https://prod-cf.supabase.co');
     assert.equal(dbCfgJson.config.anonKey, 'sb_publishable_cf_prod_key');
 
-    // 2) Non-super-admin POST /api/platform/db-config blocked with 403
+    // 2) Unauthenticated protected API calls are rejected with 401; non-super-admin POST /api/platform/db-config blocked with 403
+    const unauthQueryRes = await handleWorkerRequest(
+      new Request('https://xclouderp.workers.dev/api/erp/query', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ entityType: 'orders' }),
+      }),
+      env
+    );
+    assert.equal(unauthQueryRes.status, 401);
+
     const nonAdminRes = await handleWorkerRequest(
       new Request('https://xclouderp.workers.dev/api/platform/db-config', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: authHeaders,
         body: JSON.stringify({ portalMode: 'TENANT_WORKSPACE', projectUrl: 'https://evil.supabase.co', anonKey: 'k' }),
       }),
       env
@@ -1423,7 +1451,7 @@ test('01-core-infra: Cloudflare Workers full-stack adapter (wrangler.toml + work
     const expiredRes = await handleWorkerRequest(
       new Request('https://xclouderp.workers.dev/api/lingxing/mcp-proxy', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: authHeaders,
         body: JSON.stringify({
           tenantStatus: 'EXPIRED_READONLY',
           mcpEndpointUrl: 'https://openmcp.lingxing.com/mcp',
@@ -1437,7 +1465,7 @@ test('01-core-infra: Cloudflare Workers full-stack adapter (wrangler.toml + work
     const ssrfRes = await handleWorkerRequest(
       new Request('https://xclouderp.workers.dev/api/lingxing/mcp-proxy', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: authHeaders,
         body: JSON.stringify({
           tenantStatus: 'ACTIVE',
           mcpEndpointUrl: 'https://169.254.169.254/latest/meta-data',
@@ -1462,7 +1490,7 @@ test('01-core-infra: Cloudflare Workers full-stack adapter (wrangler.toml + work
     const badQueryRes = await handleWorkerRequest(
       new Request('https://xclouderp.workers.dev/api/erp/query', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: authHeaders,
         body: JSON.stringify({ entityType: '__forbidden__' }),
       }),
       env

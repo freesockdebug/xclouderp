@@ -24,6 +24,17 @@ import {
   INITIAL_APP_MODULES,
   INITIAL_INSTALLED_MODULES,
 } from '../src/data/initialErpData';
+import {
+  authenticateCredentials,
+  changeAccountPassword,
+  createSignedSessionToken,
+  hashPassword,
+  resetAuthServiceStateForTest,
+  setupInitialAdminAccount,
+  verifyPassword,
+  verifySignedSessionToken,
+} from '../src/services/authService';
+import { handleWorkerRequest, resetWorkerRuntimeDbConfigForTest } from '../worker';
 
 test('02-db-auth-rbac: strict portal boundary isolation rejects cross-portal elevation', () => {
   assert.equal(canAccessPortal('PLATFORM_SUPER_ADMIN', 'PLATFORM_SUPER_ADMIN'), true);
@@ -142,5 +153,173 @@ test('02-db-auth-rbac: database & auth config is strictly isolated to Super Admi
     false,
     'TenantWorkspaceSettingsView must not allow editing DB URLs or auth providers'
   );
+});
+
+test('02-db-auth-rbac: end-to-end login authentication, PBKDF2/HMAC signing, one-time setup lock, and Worker 401/403 guards (AUTH-ADV-08)', async () => {
+  resetAuthServiceStateForTest();
+  resetWorkerRuntimeDbConfigForTest();
+  try {
+    // 1. Client auth module must never touch localStorage or sessionStorage
+    const authClientSource = fs.readFileSync('src/services/authClient.ts', 'utf8');
+    assert.equal(/\b(localStorage|sessionStorage)\b/.test(authClientSource), false);
+
+    // 2. PBKDF2-SHA256 salted password hashing & constant-time verification
+    const hashA = await hashPassword('StrongPass#2026');
+    const hashB = await hashPassword('StrongPass#2026');
+    assert.ok(hashA.startsWith('pbkdf2_sha256$100000$'));
+    assert.notEqual(hashA, hashB, 'Same password must produce distinct random salts');
+    assert.equal(await verifyPassword('StrongPass#2026', hashA), true);
+    assert.equal(await verifyPassword('WrongPass#2026', hashA), false);
+
+    // 3. HMAC-SHA256 session token signing, tamper detection, and expiration
+    const secret = 'test_hmac_session_secret_at_least_32_chars';
+    const issued = await createSignedSessionToken(
+      {
+        id: 'usr-1',
+        email: 'admin@x-cloud-erp.example.com',
+        fullName: 'Super Admin',
+        role: 'PLATFORM_SUPER_ADMIN',
+        authProvider: 'LOCAL_DB',
+      },
+      secret,
+      3600
+    );
+    const verified = await verifySignedSessionToken(issued.token, secret);
+    assert.equal(verified?.email, 'admin@x-cloud-erp.example.com');
+    assert.equal(verified?.role, 'PLATFORM_SUPER_ADMIN');
+    assert.equal(await verifySignedSessionToken(`${issued.token}tamper`, secret), null);
+    assert.equal(await verifySignedSessionToken(issued.token, 'wrong_secret_value_12345'), null);
+    assert.equal(
+      await verifySignedSessionToken(issued.token, secret, Date.now() + 3601 * 1000),
+      null
+    );
+
+    // 4. First-run admin claim locks permanently after initial registration
+    const env = { AUTH_SESSION_SECRET: secret };
+    const statusBefore = await handleWorkerRequest(
+      new Request('https://xclouderp.workers.dev/api/auth/status'),
+      env
+    );
+    assert.equal(statusBefore.status, 200);
+    const statusBeforeJson = (await statusBefore.json()) as { needsInitialSetup: boolean };
+    assert.equal(statusBeforeJson.needsInitialSetup, true);
+
+    const setupRes = await handleWorkerRequest(
+      new Request('https://xclouderp.workers.dev/api/auth/setup-admin', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          email: 'owner@x-cloud-erp.example.com',
+          fullName: 'Platform Owner',
+          password: 'Initial#Password99',
+        }),
+      }),
+      env
+    );
+    assert.equal(setupRes.status, 200);
+    const setupJson = (await setupRes.json()) as {
+      ok: boolean;
+      token: string;
+      user: { email: string; role: string; passwordHash?: string };
+    };
+    assert.equal(setupJson.ok, true);
+    assert.equal(setupJson.user.role, 'PLATFORM_SUPER_ADMIN');
+    assert.equal(setupJson.user.passwordHash, undefined, 'Password hash must never leak in response');
+
+    const secondSetupRes = await handleWorkerRequest(
+      new Request('https://xclouderp.workers.dev/api/auth/setup-admin', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          email: 'hacker@x-cloud-erp.example.com',
+          password: 'Hacker#Password99',
+        }),
+      }),
+      env
+    );
+    assert.equal(secondSetupRes.status, 409);
+
+    // 5. Protected routes reject unauthenticated calls with 401 and allow verified Bearer tokens
+    const unauthBoot = await handleWorkerRequest(
+      new Request('https://xclouderp.workers.dev/api/erp/bootstrap'),
+      env
+    );
+    assert.equal(unauthBoot.status, 401);
+
+    const unauthDbWrite = await handleWorkerRequest(
+      new Request('https://xclouderp.workers.dev/api/platform/db-config', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ portalMode: 'PLATFORM_SUPER_ADMIN', projectUrl: 'https://x.supabase.co', anonKey: 'k' }),
+      }),
+      env
+    );
+    assert.equal(unauthDbWrite.status, 401);
+
+    const meRes = await handleWorkerRequest(
+      new Request('https://xclouderp.workers.dev/api/auth/me', {
+        headers: { Authorization: `Bearer ${setupJson.token}` },
+      }),
+      env
+    );
+    assert.equal(meRes.status, 200);
+
+    // 6. Password change invalidates old password and enables new password
+    const pwdChange = await changeAccountPassword(env, undefined, {
+      id: 'usr-owner',
+      email: 'owner@x-cloud-erp.example.com',
+      fullName: 'Platform Owner',
+      role: 'PLATFORM_SUPER_ADMIN',
+      authProvider: 'LOCAL_DB',
+    }, {
+      currentPassword: 'Initial#Password99',
+      newPassword: 'Rotated#Password88',
+    });
+    assert.equal(pwdChange.ok, true);
+
+    const oldLogin = await authenticateCredentials(env, undefined, {
+      email: 'owner@x-cloud-erp.example.com',
+      password: 'Initial#Password99',
+    });
+    assert.equal(oldLogin.ok, false);
+    const newLogin = await authenticateCredentials(env, undefined, {
+      email: 'owner@x-cloud-erp.example.com',
+      password: 'Rotated#Password88',
+    });
+    assert.equal(newLogin.ok, true);
+
+    // 7. Tenant-role token is blocked with 403 on POST /api/platform/db-config even if portalMode is spoofed
+    const tenantIssued = await createSignedSessionToken(
+      {
+        id: 'usr-tenant-1',
+        email: 'ops@seller.example.com',
+        fullName: 'Tenant Ops',
+        role: 'TENANT_USER',
+        tenantId: 'tenant-alpha-01',
+        authProvider: 'LOCAL_DB',
+      },
+      secret,
+      3600
+    );
+    const tenantDbWrite = await handleWorkerRequest(
+      new Request('https://xclouderp.workers.dev/api/platform/db-config', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${tenantIssued.token}`,
+        },
+        body: JSON.stringify({
+          portalMode: 'PLATFORM_SUPER_ADMIN',
+          projectUrl: 'https://evil.supabase.co',
+          anonKey: 'k',
+        }),
+      }),
+      env
+    );
+    assert.equal(tenantDbWrite.status, 403);
+  } finally {
+    resetAuthServiceStateForTest();
+    resetWorkerRuntimeDbConfigForTest();
+  }
 });
 

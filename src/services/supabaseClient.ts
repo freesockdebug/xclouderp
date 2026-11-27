@@ -1,4 +1,5 @@
 import { createClient, SupabaseClient } from '@supabase/supabase-js';
+import { getAuthHeaders, notifyUnauthorized } from './authClient';
 
 export type SupabaseConfigSource = 'ENV' | 'SERVER_MEMORY' | 'CLIENT_MEMORY' | 'UNCONFIGURED';
 
@@ -189,7 +190,7 @@ export async function saveServerSupabaseConfig(
   try {
     const res = await fetch('/api/platform/db-config', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', ...getAuthHeaders() },
       body: JSON.stringify({
         portalMode: 'PLATFORM_SUPER_ADMIN',
         projectUrl: normalized.projectUrl,
@@ -199,6 +200,14 @@ export async function saveServerSupabaseConfig(
         logtoAppId: normalized.logtoAppId,
       }),
     });
+    if (res.status === 401) {
+      notifyUnauthorized();
+      return {
+        ok: false,
+        config: saveSupabaseConfig({ ...normalized, configSource: 'CLIENT_MEMORY' }),
+        message: '登录会话已失效，请重新登录超级管理员账号后再保存配置。',
+      };
+    }
     const data = (await res.json()) as {
       ok?: boolean;
       config?: Partial<SupabaseConnectionConfig>;

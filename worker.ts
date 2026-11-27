@@ -13,6 +13,16 @@ import {
   fetchPageDataFromSupabase,
   invalidateBackendEntityCache,
 } from './src/services/backendDataEngine';
+import {
+  authenticateCredentials,
+  changeAccountPassword,
+  getAuthStatus,
+  setupInitialAdminAccount,
+  upsertMemberLoginAccount,
+  verifyRequestBearerAuth,
+  type AuthEnvVars,
+  type AuthSessionUser,
+} from './src/services/authService';
 import type { ErpEntityType } from './src/services/erpDatabaseService';
 import type { ExchangeRateItem } from './src/types/erp';
 
@@ -27,6 +37,9 @@ export interface CloudflareWorkerEnv {
   VITE_SUPABASE_URL?: string;
   VITE_SUPABASE_ANON_KEY?: string;
   AUTH_MODE?: string;
+  AUTH_SESSION_SECRET?: string;
+  ADMIN_LOGIN_EMAIL?: string;
+  ADMIN_LOGIN_PASSCODE?: string;
   LOGTO_ENDPOINT?: string;
   LOGTO_APP_ID?: string;
   VITE_LOGTO_ENDPOINT?: string;
@@ -250,6 +263,41 @@ function hydrateSchedulerConfigFromWorkerEnv(env: CloudflareWorkerEnv): void {
   });
 }
 
+function getWorkerAuthEnv(env: CloudflareWorkerEnv): AuthEnvVars {
+  return {
+    AUTH_SESSION_SECRET: typeof env.AUTH_SESSION_SECRET === 'string' ? env.AUTH_SESSION_SECRET : undefined,
+    ADMIN_LOGIN_EMAIL: typeof env.ADMIN_LOGIN_EMAIL === 'string' ? env.ADMIN_LOGIN_EMAIL : undefined,
+    ADMIN_LOGIN_PASSCODE: typeof env.ADMIN_LOGIN_PASSCODE === 'string' ? env.ADMIN_LOGIN_PASSCODE : undefined,
+    AUTH_MODE: typeof env.AUTH_MODE === 'string' ? env.AUTH_MODE : undefined,
+  };
+}
+
+async function requireAuthenticatedSession(
+  request: Request,
+  env: CloudflareWorkerEnv
+): Promise<{ ok: true; session: AuthSessionUser } | { ok: false; response: Response }> {
+  const { config } = getEffectiveWorkerDbConfig(env);
+  const session = await verifyRequestBearerAuth(
+    request.headers.get('authorization'),
+    getWorkerAuthEnv(env),
+    config
+  );
+  if (!session) {
+    return {
+      ok: false,
+      response: jsonResponse(
+        {
+          ok: false,
+          errorCode: 'AUTH_REQUIRED',
+          message: '未登录或会话已过期，请先完成身份验证。',
+        },
+        401
+      ),
+    };
+  }
+  return { ok: true, session };
+}
+
 export async function handleWorkerRequest(
   request: Request,
   env: CloudflareWorkerEnv
@@ -267,8 +315,133 @@ export async function handleWorkerRequest(
     });
   }
 
+  // 0. AUTHENTICATION GATEWAY (/api/auth/*)
+  if (pathname === '/api/auth/status' && method === 'GET') {
+    const { config } = getEffectiveWorkerDbConfig(env);
+    const status = await getAuthStatus(getWorkerAuthEnv(env), config);
+    return jsonResponse({ ok: true, ...status });
+  }
+
+  if (pathname === '/api/auth/setup-admin' && method === 'POST') {
+    const parsed = await readJsonBody(request);
+    if (!parsed.ok) {
+      return jsonResponse({ ok: false, errorCode: 'INVALID_JSON', message: '请求体 JSON 格式无效' }, 400);
+    }
+    const { config } = getEffectiveWorkerDbConfig(env);
+    const result = await setupInitialAdminAccount(getWorkerAuthEnv(env), config, {
+      email: typeof parsed.data.email === 'string' ? parsed.data.email : '',
+      fullName: typeof parsed.data.fullName === 'string' ? parsed.data.fullName : '',
+      password: typeof parsed.data.password === 'string' ? parsed.data.password : '',
+    });
+    if (!result.ok) {
+      return jsonResponse(
+        { ok: false, errorCode: result.errorCode, message: result.message },
+        result.status
+      );
+    }
+    return jsonResponse({
+      ok: true,
+      token: result.token,
+      expiresAt: result.expiresAt,
+      user: result.user,
+      persistedToDb: result.persistedToDb,
+    });
+  }
+
+  if (pathname === '/api/auth/login' && method === 'POST') {
+    const parsed = await readJsonBody(request);
+    if (!parsed.ok) {
+      return jsonResponse({ ok: false, errorCode: 'INVALID_JSON', message: '请求体 JSON 格式无效' }, 400);
+    }
+    const { config } = getEffectiveWorkerDbConfig(env);
+    const result = await authenticateCredentials(getWorkerAuthEnv(env), config, {
+      email: typeof parsed.data.email === 'string' ? parsed.data.email : '',
+      password: typeof parsed.data.password === 'string' ? parsed.data.password : '',
+    });
+    if (!result.ok) {
+      return jsonResponse(
+        { ok: false, errorCode: result.errorCode, message: result.message },
+        result.status
+      );
+    }
+    return jsonResponse({
+      ok: true,
+      token: result.token,
+      expiresAt: result.expiresAt,
+      user: result.user,
+    });
+  }
+
+  if (pathname === '/api/auth/logout' && method === 'POST') {
+    return jsonResponse({ ok: true });
+  }
+
+  if (pathname === '/api/auth/me' && method === 'GET') {
+    const auth = await requireAuthenticatedSession(request, env);
+    if (!auth.ok) return auth.response;
+    return jsonResponse({ ok: true, user: auth.session });
+  }
+
+  if (pathname === '/api/auth/change-password' && method === 'POST') {
+    const auth = await requireAuthenticatedSession(request, env);
+    if (!auth.ok) return auth.response;
+    const parsed = await readJsonBody(request);
+    if (!parsed.ok) {
+      return jsonResponse({ ok: false, errorCode: 'INVALID_JSON', message: '请求体 JSON 格式无效' }, 400);
+    }
+    const { config } = getEffectiveWorkerDbConfig(env);
+    const result = await changeAccountPassword(getWorkerAuthEnv(env), config, auth.session, {
+      currentPassword:
+        typeof parsed.data.currentPassword === 'string' ? parsed.data.currentPassword : '',
+      newPassword: typeof parsed.data.newPassword === 'string' ? parsed.data.newPassword : '',
+    });
+    if (!result.ok) {
+      return jsonResponse(
+        { ok: false, errorCode: result.errorCode, message: result.message },
+        result.status
+      );
+    }
+    return jsonResponse({
+      ok: true,
+      token: result.token,
+      expiresAt: result.expiresAt,
+      message: result.message,
+    });
+  }
+
+  if (pathname === '/api/auth/register-member' && method === 'POST') {
+    const auth = await requireAuthenticatedSession(request, env);
+    if (!auth.ok) return auth.response;
+    const parsed = await readJsonBody(request);
+    if (!parsed.ok) {
+      return jsonResponse({ ok: false, errorCode: 'INVALID_JSON', message: '请求体 JSON 格式无效' }, 400);
+    }
+    const { config } = getEffectiveWorkerDbConfig(env);
+    const result = await upsertMemberLoginAccount(getWorkerAuthEnv(env), config, auth.session, {
+      email: typeof parsed.data.email === 'string' ? parsed.data.email : '',
+      fullName: typeof parsed.data.fullName === 'string' ? parsed.data.fullName : '',
+      password: typeof parsed.data.password === 'string' ? parsed.data.password : '',
+      role: parsed.data.role === 'PLATFORM_SUPER_ADMIN' ? 'PLATFORM_SUPER_ADMIN' : 'TENANT_USER',
+      tenantId: typeof parsed.data.tenantId === 'string' ? parsed.data.tenantId : undefined,
+      memberId: typeof parsed.data.memberId === 'string' ? parsed.data.memberId : undefined,
+    });
+    if (!result.ok) {
+      return jsonResponse(
+        { ok: false, errorCode: result.errorCode, message: result.message },
+        result.status
+      );
+    }
+    return jsonResponse({
+      ok: true,
+      user: result.user,
+      persistedToDb: result.persistedToDb,
+    });
+  }
+
   // 1. UPSTREAM LINGXING MCP PROXY (/api/lingxing/mcp-proxy)
   if (pathname === '/api/lingxing/mcp-proxy' && method === 'POST') {
+    const auth = await requireAuthenticatedSession(request, env);
+    if (!auth.ok) return auth.response;
     const startTime = Date.now();
     const parsed = await readJsonBody(request);
     if (!parsed.ok) {
@@ -737,6 +910,8 @@ export async function handleWorkerRequest(
 
   // 3. SCHEDULED LINGXING AUTO-SYNC ROUTES (/api/lingxing/scheduler/*)
   if (pathname === '/api/lingxing/scheduler/status' && method === 'GET') {
+    const auth = await requireAuthenticatedSession(request, env);
+    if (!auth.ok) return auth.response;
     hydrateSchedulerConfigFromWorkerEnv(env);
     return jsonResponse({
       ok: true,
@@ -745,6 +920,8 @@ export async function handleWorkerRequest(
   }
 
   if (pathname === '/api/lingxing/scheduler/configure' && method === 'POST') {
+    const auth = await requireAuthenticatedSession(request, env);
+    if (!auth.ok) return auth.response;
     const parsed = await readJsonBody(request);
     if (!parsed.ok) {
       return jsonResponse({ ok: false, errorCode: 'INVALID_JSON', message: '请求体 JSON 格式无效' }, 400);
@@ -803,6 +980,8 @@ export async function handleWorkerRequest(
   }
 
   if (pathname === '/api/lingxing/scheduler/trigger' && method === 'POST') {
+    const auth = await requireAuthenticatedSession(request, env);
+    if (!auth.ok) return auth.response;
     const parsed = await readJsonBody(request);
     if (!parsed.ok) {
       return jsonResponse({ ok: false, errorCode: 'INVALID_JSON', message: '请求体 JSON 格式无效' }, 400);
@@ -841,6 +1020,8 @@ export async function handleWorkerRequest(
   }
 
   if (pathname === '/api/platform/db-config' && method === 'POST') {
+    const auth = await requireAuthenticatedSession(request, env);
+    if (!auth.ok) return auth.response;
     const parsed = await readJsonBody(request);
     if (!parsed.ok) {
       return jsonResponse({ ok: false, errorCode: 'INVALID_JSON', message: '请求体 JSON 格式无效' }, 400);
@@ -854,7 +1035,7 @@ export async function handleWorkerRequest(
       logtoAppId = 'app_xcloud_b2b_orgs',
     } = parsed.data;
 
-    if (portalMode !== 'PLATFORM_SUPER_ADMIN') {
+    if (auth.session.role !== 'PLATFORM_SUPER_ADMIN' || portalMode !== 'PLATFORM_SUPER_ADMIN') {
       return jsonResponse(
         {
           ok: false,
@@ -943,6 +1124,8 @@ export async function handleWorkerRequest(
 
   // 5. ON-DEMAND BACKEND DATA & SERVER PAGINATION (/api/erp/*)
   if (pathname === '/api/erp/bootstrap' && method === 'GET') {
+    const auth = await requireAuthenticatedSession(request, env);
+    if (!auth.ok) return auth.response;
     const startTime = Date.now();
     const { config } = getEffectiveWorkerDbConfig(env);
     const result = await fetchBootstrapFromSupabase(config);
@@ -957,6 +1140,8 @@ export async function handleWorkerRequest(
   }
 
   if (pathname === '/api/erp/page-data' && method === 'POST') {
+    const auth = await requireAuthenticatedSession(request, env);
+    if (!auth.ok) return auth.response;
     const startTime = Date.now();
     const parsed = await readJsonBody(request);
     if (!parsed.ok) {
@@ -982,11 +1167,18 @@ export async function handleWorkerRequest(
       );
     }
 
+    const effectiveTenantId =
+      auth.session.role !== 'PLATFORM_SUPER_ADMIN' && auth.session.tenantId
+        ? auth.session.tenantId
+        : typeof tenantId === 'string'
+        ? tenantId.trim()
+        : undefined;
+
     const { config } = getEffectiveWorkerDbConfig(env);
     const result = await fetchPageDataFromSupabase({
       config,
       pageId: cleanPageId,
-      tenantId: typeof tenantId === 'string' ? tenantId.trim() : undefined,
+      tenantId: effectiveTenantId,
       roleCode: typeof roleCode === 'string' ? roleCode.trim() : undefined,
       allowedShopIds: Array.isArray(allowedShopIds)
         ? allowedShopIds.filter((s): s is string => typeof s === 'string')
@@ -1000,6 +1192,8 @@ export async function handleWorkerRequest(
   }
 
   if (pathname === '/api/erp/query' && method === 'POST') {
+    const auth = await requireAuthenticatedSession(request, env);
+    if (!auth.ok) return auth.response;
     const startTime = Date.now();
     const parsed = await readJsonBody(request);
     if (!parsed.ok) {
@@ -1030,7 +1224,12 @@ export async function handleWorkerRequest(
     }
 
     const { config } = getEffectiveWorkerDbConfig(env);
-    const cleanTenantId = typeof tenantId === 'string' ? tenantId.trim() : undefined;
+    const cleanTenantId =
+      auth.session.role !== 'PLATFORM_SUPER_ADMIN' && auth.session.tenantId
+        ? auth.session.tenantId
+        : typeof tenantId === 'string'
+        ? tenantId.trim()
+        : undefined;
     const sliceRes = await fetchEntitySliceFromSupabase(config, cleanEntity, cleanTenantId);
     if (sliceRes.status !== 'LOADED') {
       return jsonResponse({
@@ -1076,6 +1275,8 @@ export async function handleWorkerRequest(
   }
 
   if (pathname === '/api/erp/cache/invalidate' && method === 'POST') {
+    const auth = await requireAuthenticatedSession(request, env);
+    if (!auth.ok) return auth.response;
     const parsed = await readJsonBody(request);
     if (!parsed.ok) {
       return jsonResponse({ ok: false, errorCode: 'INVALID_JSON', message: '请求体 JSON 格式无效' }, 400);

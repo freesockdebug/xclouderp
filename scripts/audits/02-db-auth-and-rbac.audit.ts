@@ -21,6 +21,15 @@ import {
   INITIAL_APP_MODULES,
   INITIAL_INSTALLED_MODULES,
 } from '../../src/data/initialErpData';
+import {
+  authenticateCredentials,
+  createSignedSessionToken,
+  hashPassword,
+  resetAuthServiceStateForTest,
+  setupInitialAdminAccount,
+  verifyPassword,
+  verifySignedSessionToken,
+} from '../../src/services/authService';
 
 const DOMAIN = '02-db-auth-and-rbac';
 const DOC_PATH = 'docs/02-db-auth-and-rbac.md';
@@ -39,8 +48,12 @@ export const dbAuthRbacAuditSuite: DomainAuditSuite = {
     /^src\/components\/TenantSubscriptionView\.tsx$/,
     /^src\/components\/TenantAppMarketplaceView\.tsx$/,
     /^src\/components\/TenantWorkspaceSettingsView\.tsx$/,
+    /^src\/components\/LoginGateView\.tsx$/,
+    /^src\/services\/authService\.ts$/,
+    /^src\/services\/authClient\.ts$/,
     /^src\/App\.tsx$/,
     /^server\.ts$/,
+    /^worker\.ts$/,
     /^docs\/02-db-auth-and-rbac\.md$/,
     /^scripts\/audits\/02-/,
   ],
@@ -332,6 +345,93 @@ export const dbAuthRbacAuditSuite: DomainAuditSuite = {
         return violations;
       },
     },
+    {
+      id: 'AUTH-ADV-08',
+      domain: DOMAIN,
+      docPath: DOC_PATH,
+      title: '系统必须启用全链路登录验证：服务端 PBKDF2/HMAC 签名鉴权、首启一次注册锁定、双网关 401 拦截与纯内存前端 Token',
+      historicalContext:
+        '未启用登录门禁时，任何访问者均可免密直连全平台 /api/erp/*、领星同步与数据库配置写接口；若前端将 Bearer Token 落入 localStorage 还会放大 XSS 窃取风险。',
+      remediation:
+        '保留 src/services/authService.ts、src/services/authClient.ts（禁用 localStorage/sessionStorage）、src/components/LoginGateView.tsx，并在 server.ts、worker.ts 与 src/App.tsx 中完整执行 /api/auth/* 与 requireAuthenticatedSession 守卫。',
+      check(ctx) {
+        const violations: AuditViolation[] = [];
+        const requiredFiles = [
+          'src/services/authService.ts',
+          'src/services/authClient.ts',
+          'src/components/LoginGateView.tsx',
+        ];
+        for (const f of requiredFiles) {
+          if (!ctx.fileExists(f)) {
+            violations.push({
+              ruleId: 'AUTH-ADV-08',
+              domain: DOMAIN,
+              docPath: DOC_PATH,
+              title: `缺失登录认证核心模块: ${f}`,
+              historicalContext: '登录验证体系必须包含服务端鉴权内核、客户端内存态令牌模块与登录门禁视图。',
+              file: f,
+              remediation: `创建并恢复 ${f}。`,
+            });
+          }
+        }
+        if (violations.length > 0) return violations;
+
+        const authClientCode = ctx.readFile('src/services/authClient.ts');
+        if (/\b(localStorage|sessionStorage)\b/.test(authClientCode)) {
+          violations.push({
+            ruleId: 'AUTH-ADV-08',
+            domain: DOMAIN,
+            docPath: DOC_PATH,
+            title: 'src/services/authClient.ts 违规使用 localStorage/sessionStorage 持久化认证 Token',
+            historicalContext: '浏览器明文持久化 Bearer Token 在同源脚本风险下会被直接窃取。',
+            file: 'src/services/authClient.ts',
+            remediation: '仅在模块运行内存中保存 Bearer Token，移除所有 localStorage/sessionStorage 调用。',
+          });
+        }
+
+        const appCode = ctx.readFile('src/App.tsx');
+        if (!/<LoginGateView\b/.test(appCode) || !/logoutAuthSession/.test(appCode)) {
+          violations.push({
+            ruleId: 'AUTH-ADV-08',
+            domain: DOMAIN,
+            docPath: DOC_PATH,
+            title: 'src/App.tsx 未挂载 LoginGateView 登录门禁或缺少 logoutAuthSession 退出流',
+            historicalContext: '未登录用户严禁进入 ERP 主工作台，且必须提供完整登出清理入口。',
+            file: 'src/App.tsx',
+            remediation: '在 src/App.tsx 中对未认证状态渲染 <LoginGateView /> 并接入 logoutAuthSession。',
+          });
+        }
+
+        const serverCode = ctx.readFile('server.ts');
+        const workerCode = ctx.readFile('worker.ts');
+        const requiredGatewayTokens = [
+          '/api/auth/status',
+          '/api/auth/setup-admin',
+          '/api/auth/login',
+          '/api/auth/me',
+          'requireAuthenticatedSession',
+          'AUTH_REQUIRED',
+        ];
+        for (const [label, code] of [
+          ['server.ts', serverCode],
+          ['worker.ts', workerCode],
+        ] as const) {
+          const missing = requiredGatewayTokens.filter((t) => !code.includes(t));
+          if (missing.length > 0) {
+            violations.push({
+              ruleId: 'AUTH-ADV-08',
+              domain: DOMAIN,
+              docPath: DOC_PATH,
+              title: `${label} 缺失服务端认证路由或 401 鉴权守卫: ${missing.join(', ')}`,
+              historicalContext: 'Node Express 与 Cloudflare Workers 必须对等执行登录验证与受保护 API 拦截。',
+              file: label,
+              remediation: `在 ${label} 中补齐 /api/auth/* 路由与 requireAuthenticatedSession 守卫。`,
+            });
+          }
+        }
+        return violations;
+      },
+    },
   ],
   async verify() {
     const violations: AuditViolation[] = [];
@@ -495,6 +595,95 @@ export const dbAuthRbacAuditSuite: DomainAuditSuite = {
         file: 'src/lib/erpEngine.ts',
         remediation: '检查 isValidImpersonationSession 租户存在性验证。',
       });
+    }
+    // 7. Memory fault injection for AUTH-ADV-08: PBKDF2 hashing, HMAC session tamper/expiry, and one-time admin claim lock
+    resetAuthServiceStateForTest();
+    try {
+      const hash = await hashPassword('XCloud#Strong99');
+      const okPwd = await verifyPassword('XCloud#Strong99', hash);
+      const badPwd = await verifyPassword('WrongPass!00', hash);
+      const signingKey = 'unit_audit_signing_secret_32bytes_min';
+      const minted = await createSignedSessionToken(
+        {
+          id: 'usr-audit-1',
+          email: 'admin@x-cloud-erp.example.com',
+          fullName: 'Audit Admin',
+          role: 'PLATFORM_SUPER_ADMIN',
+          authProvider: 'LOCAL_DB',
+        },
+        signingKey,
+        3600
+      );
+      const verified = await verifySignedSessionToken(minted.token, signingKey);
+      const tampered = await verifySignedSessionToken(`${minted.token}x`, signingKey);
+      const expired = await verifySignedSessionToken(
+        minted.token,
+        signingKey,
+        Date.now() + 7200 * 1000
+      );
+
+      const firstClaim = await setupInitialAdminAccount(
+        { AUTH_SESSION_SECRET: signingKey },
+        undefined,
+        {
+          email: 'owner@x-cloud-erp.example.com',
+          fullName: 'Owner Admin',
+          password: 'Owner#Password2026',
+        }
+      );
+      const secondClaim = await setupInitialAdminAccount(
+        { AUTH_SESSION_SECRET: signingKey },
+        undefined,
+        {
+          email: 'attacker@x-cloud-erp.example.com',
+          fullName: 'Attacker',
+          password: 'Attacker#Password2026',
+        }
+      );
+      const loginOk = await authenticateCredentials(
+        { AUTH_SESSION_SECRET: signingKey },
+        undefined,
+        {
+          email: 'owner@x-cloud-erp.example.com',
+          password: 'Owner#Password2026',
+        }
+      );
+      const loginBad = await authenticateCredentials(
+        { AUTH_SESSION_SECRET: signingKey },
+        undefined,
+        {
+          email: 'owner@x-cloud-erp.example.com',
+          password: 'WrongPassword2026',
+        }
+      );
+
+      if (
+        !hash.startsWith('pbkdf2_sha256$') ||
+        !okPwd ||
+        badPwd ||
+        !verified ||
+        verified.email !== 'admin@x-cloud-erp.example.com' ||
+        tampered !== null ||
+        expired !== null ||
+        !firstClaim.ok ||
+        secondClaim.ok ||
+        secondClaim.status !== 409 ||
+        !loginOk.ok ||
+        loginBad.ok ||
+        loginBad.status !== 401
+      ) {
+        violations.push({
+          ruleId: 'AUTH-ADV-08',
+          domain: DOMAIN,
+          docPath: DOC_PATH,
+          title: '内存故障注入失败: 登录密码哈希、签名会话防篡改/过期校验或首次管理员注册锁定异常',
+          historicalContext: '登录认证引擎必须确保密码单向加盐校验、防伪造签名与一次性初始管理员注册锁定严格生效。',
+          file: 'src/services/authService.ts',
+          remediation: '检查 hashPassword、verifyPassword、verifySignedSessionToken 与 setupInitialAdminAccount 实现。',
+        });
+      }
+    } finally {
+      resetAuthServiceStateForTest();
     }
     return violations;
   },
